@@ -11,6 +11,12 @@ from fft_conv_pytorch.fft_conv import fft_conv, to_ntuple
 from fft_conv_pytorch.utils import Benchmark, benchmark
 
 
+def cuda_sync(func, *args, **kwargs):
+    X = func(*args, **kwargs)
+    torch.cuda.synchronize()
+    return X
+
+
 @lru_cache(maxsize=1)
 def _get_conv_inputs(
     ndim: int,
@@ -27,7 +33,7 @@ def _get_conv_inputs(
     weight = torch.randn(out_channels, in_channels, *kernel_size, requires_grad=True)
     bias = torch.randn(out_channels, requires_grad=True)
 
-    return signal, weight, bias
+    return signal.cuda(), weight.cuda(), bias.cuda()
 
 
 def benchmark_conv(
@@ -41,7 +47,13 @@ def benchmark_conv(
     signal, weight, bias = _get_conv_inputs(
         ndim=ndim, input_size=input_size, kernel_size=kernel_size
     )
-    return benchmark(conv_fn, signal, weight, bias=bias, num_iterations=num_iterations)
+    return benchmark(
+        partial(cuda_sync, conv_fn),
+        signal,
+        weight,
+        bias=bias,
+        num_iterations=num_iterations,
+    )
 
 
 def benchmark_kernel_size(
