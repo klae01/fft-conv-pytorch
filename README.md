@@ -17,9 +17,7 @@ pip install fft-conv-pytorch
 
 From source:
 ```bash
-git clone https://github.com/fkodom/fft-conv-pytorch.git
-cd fft-conv-pytorch
-pip install .
+pip install git+https://github.com/klae01/fft-conv-pytorch.git
 ```
 
 ## Example Usage
