@@ -8,25 +8,19 @@ from torch.fft import irfftn, rfftn
 
 
 def complex_matmul(a: Tensor, b: Tensor, groups: int = 1) -> Tensor:
-    return (
-        torch.einsum(
-            "BGCt,GcCt->BGct",
-            a.unflatten(1, [groups, -1]).flatten(3),  # B G C ...
-            b.unflatten(0, [groups, -1]).flatten(3),  # G OC IC ...
-        )
-        .unflatten(3, a.shape[2:])
-        .flatten(1, 2)
-    )
+    return torch.einsum(
+        "BGC...,GcC...->BGc...",
+        a.unflatten(1, [groups, -1]),  # B G C ...
+        b.unflatten(0, [groups, -1]),  # G OC IC ...
+    ).flatten(1, 2)
 
 
 def to_ntuple(val: Union[int, Iterable[int]], n: int) -> Tuple[int, ...]:
     """Casts to a tuple with length 'n'.  Useful for automatically computing the
     padding and stride for convolutions, where users may only provide an integer.
-
     Args:
         val: (Union[int, Iterable[int]]) Value to cast into a tuple.
         n: (int) Desired length of the tuple
-
     Returns:
         (Tuple[int, ...]) Tuple of length 'n'
     """
@@ -53,7 +47,6 @@ def fft_conv(
     """Performs N-d convolution of Tensors using a fast fourier transform, which
     is very fast for large kernel sizes. Also, optionally adds a bias Tensor after
     the convolution (in order ot mimic the PyTorch direct convolution).
-
     Args:
         signal: (Tensor) Input tensor to be convolved with the kernel.
         kernel: (Tensor) Convolution kernel.
@@ -61,7 +54,6 @@ def fft_conv(
         padding: (Union[int, Iterable[int]) Number of zero samples to pad the
             input on the last dimension.
         stride: (Union[int, Iterable[int]) Stride size for computing output values.
-
     Returns:
         (Tensor) Convolved tensor
     """
@@ -88,25 +80,13 @@ def fft_conv(
 
     # Because PyTorch computes a *one-sided* FFT, we need the final dimension to
     # have *even* length.  Just pad with one more zero if the final dimension is odd.
-    if signal.size(-1) % 2 != 0:
-        signal_ = f.pad(signal, [0, 1])
-    else:
-        signal_ = signal
-
-    kernel_padding = [
-        pad
-        for i in reversed(range(2, signal_.ndim))
-        for pad in [0, signal_.size(i) - kernel.size(i)]
-    ]
-    padded_kernel = f.pad(kernel, kernel_padding)
+    interm_shape = [(s + 1) // 2 * 2 for s in signal.shape[2:]]
 
     # Perform fourier convolution -- FFT, matrix multiply, then IFFT
-    # signal_ = signal_.reshape(signal_.size(0), groups, -1, *signal_.shape[2:])
-    signal_fr = rfftn(signal_, dim=tuple(range(2, signal.ndim)))
-    kernel_fr = rfftn(padded_kernel, dim=tuple(range(2, signal.ndim)))
+    signal_fr = rfftn(signal, interm_shape, dim=tuple(range(2, signal.ndim)))
+    kernel_fr = rfftn(kernel, interm_shape, dim=tuple(range(2, signal.ndim)))
 
-    kernel_fr.imag *= -1
-    output_fr = complex_matmul(signal_fr, kernel_fr, groups=groups)
+    output_fr = complex_matmul(signal_fr, kernel_fr.conj(), groups=groups)
     output = irfftn(output_fr, dim=tuple(range(2, signal.ndim)))
 
     # Remove extra padded values
