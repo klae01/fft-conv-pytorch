@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as f
 
-from fft_conv_pytorch.nn import _FFTConv
+from fft_conv_pytorch.nn import _FFTConvNd as _FFTConv
 from fft_conv_pytorch.benchmark_utils import _assert_almost_equal, _gcd
 
 

@@ -20,11 +20,11 @@ def fft_conv(
     signal: Tensor,
     kernel: Tensor,
     bias: Tensor = None,
-    padding: Union[int, Iterable[int]] = 0,
-    padding_mode: str = "constant",
     stride: Union[int, Iterable[int]] = 1,
+    padding: Union[int, Iterable[int]] = 0,
     dilation: Union[int, Iterable[int]] = 1,
     groups: int = 1,
+    padding_mode: str = "constant",
 ) -> Tensor:
     """Performs N-d convolution of Tensors using a fast fourier transform, which
     is very fast for large kernel sizes. Also, optionally adds a bias Tensor after
@@ -33,9 +33,9 @@ def fft_conv(
         signal: (Tensor) Input tensor to be convolved with the kernel.
         kernel: (Tensor) Convolution kernel.
         bias: (Tensor) Bias tensor to add to the output.
+        stride: (Union[int, Iterable[int]) Stride size for computing output values.
         padding: (Union[int, Iterable[int]) Number of zero samples to pad the
             input on the last dimension.
-        stride: (Union[int, Iterable[int]) Stride size for computing output values.
     Returns:
         (Tensor) Convolved tensor
     """

@@ -3,12 +3,13 @@ from typing import Iterable, Tuple, Union
 
 import torch
 from torch import Tensor, nn
+from torch.nn.modules.conv import _ConvNd
 
 from .functional import fft_conv
 from .utils import to_ntuple
 
 
-class _FFTConv(nn.Module):
+class _FFTConvNd(_ConvNd):
     """Base class for PyTorch FFT convolution layers."""
 
     def __init__(
@@ -16,65 +17,51 @@ class _FFTConv(nn.Module):
         in_channels: int,
         out_channels: int,
         kernel_size: Union[int, Iterable[int]],
-        padding: Union[int, Iterable[int]] = 0,
-        padding_mode: str = "constant",
         stride: Union[int, Iterable[int]] = 1,
+        padding: Union[int, str, Iterable[int]] = 0,
         dilation: Union[int, Iterable[int]] = 1,
         groups: int = 1,
         bias: bool = True,
+        padding_mode: str = "zeros",
+        device=None,
+        dtype=None,
         ndim: int = 1,
-    ):
-        """
-        Args:
-            in_channels: (int) Number of channels in input tensors
-            out_channels: (int) Number of channels in output tensors
-            kernel_size: (Union[int, Iterable[int]) Square radius of the kernel
-            padding: (Union[int, Iterable[int]) Number of zero samples to pad the
-                input on the last dimension.
-            stride: (Union[int, Iterable[int]) Stride size for computing output values.
-            bias: (bool) If True, includes bias, which is added after convolution
-        """
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.padding = padding
-        self.padding_mode = padding_mode
-        self.stride = stride
-        self.dilation = dilation
-        self.groups = groups
-        self.use_bias = bias
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
+        kernel_size_ = to_ntuple(kernel_size, ndim)
+        stride_ = to_ntuple(stride, ndim)
+        padding_ = padding if isinstance(padding, str) else to_ntuple(padding, ndim)
+        dilation_ = to_ntuple(dilation, ndim)
+        super(_FFTConvNd, self).__init__(
+            in_channels,
+            out_channels,
+            kernel_size_,
+            stride_,
+            padding_,
+            dilation_,
+            False,
+            to_ntuple(0, ndim),
+            groups,
+            bias,
+            padding_mode,
+            **factory_kwargs
+        )
 
-        if in_channels % groups != 0:
-            raise ValueError(
-                "'in_channels' must be divisible by 'groups'."
-                f"Found: in_channels={in_channels}, groups={groups}."
-            )
-        if out_channels % groups != 0:
-            raise ValueError(
-                "'out_channels' must be divisible by 'groups'."
-                f"Found: out_channels={out_channels}, groups={groups}."
-            )
-
-        kernel_size = to_ntuple(kernel_size, ndim)
-        weight = torch.randn(out_channels, in_channels // groups, *kernel_size)
-
-        self.weight = nn.Parameter(weight)
-        self.bias = nn.Parameter(torch.randn(out_channels)) if bias else None
-
-    def forward(self, signal):
+    def forward(self, signal: Tensor):
+        assert signal.ndim == self.weight.ndim
+        padding_mode = [self.padding_mode, "constant"][self.padding_mode == "zeros"]
         return fft_conv(
             signal,
             self.weight,
             bias=self.bias,
-            padding=self.padding,
-            padding_mode=self.padding_mode,
             stride=self.stride,
+            padding=self.padding,
             dilation=self.dilation,
             groups=self.groups,
+            padding_mode=padding_mode,
         )
 
 
-FFTConv1d = partial(_FFTConv, ndim=1)
-FFTConv2d = partial(_FFTConv, ndim=2)
-FFTConv3d = partial(_FFTConv, ndim=3)
+FFTConv1d = partial(_FFTConvNd, ndim=1)
+FFTConv2d = partial(_FFTConvNd, ndim=2)
+FFTConv3d = partial(_FFTConvNd, ndim=3)
