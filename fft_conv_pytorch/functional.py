@@ -105,7 +105,7 @@ def fft_conv_transpose(
 
     kernel = (
         kernel.flip(*range(2, signal.ndim))
-        .unflatten(0, [groups, -1])
+        .unflatten(0, [groups, kernel.size(0) // groups])
         .transpose_(1, 2)
         .flatten(0, 1)
     )
