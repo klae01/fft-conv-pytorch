@@ -4,8 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as f
 
-from fft_conv_pytorch.nn import FFTConv1d, FFTConv2d, FFTConv3d
 from fft_conv_pytorch.benchmark_utils import _assert_almost_equal, _gcd
+from fft_conv_pytorch.nn import FFTConv1d, FFTConv2d, FFTConv3d
 
 
 @pytest.mark.parametrize("in_channels", [2, 3])

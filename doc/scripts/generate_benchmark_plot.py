@@ -1,15 +1,15 @@
 from functools import lru_cache, partial
-from typing import Dict, Iterable, List, Optional, Sequence, Union, Callable
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as f
-from tqdm import tqdm
 from matplotlib.ticker import MaxNLocator
+from tqdm import tqdm
 
-from fft_conv_pytorch.functional import fft_conv, fft_conv_transpose, to_ntuple
 from fft_conv_pytorch.benchmark_utils import Benchmark, benchmark
+from fft_conv_pytorch.functional import fft_conv, fft_conv_transpose, to_ntuple
 
 
 def cuda_sync(func, *args, **kwargs):
