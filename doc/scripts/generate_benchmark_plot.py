@@ -7,8 +7,8 @@ import torch
 import torch.nn.functional as f
 from tqdm import tqdm
 
-from fft_conv_pytorch.fft_conv import fft_conv, to_ntuple
-from fft_conv_pytorch.utils import Benchmark, benchmark
+from fft_conv_pytorch.functional import fft_conv, to_ntuple
+from fft_conv_pytorch.benchmark_utils import Benchmark, benchmark
 
 
 def cuda_sync(func, *args, **kwargs):
