@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as f
 
-from fft_conv_pytorch.nn import _FFTConvNd as _FFTConv
+from fft_conv_pytorch.nn import FFTConv1d, FFTConv2d, FFTConv3d
 from fft_conv_pytorch.benchmark_utils import _assert_almost_equal, _gcd
 
 
@@ -32,7 +32,7 @@ def test_fft_conv_module(
 ):
     torch_conv = getattr(f, f"conv{ndim}d")
     groups = _gcd(in_channels, _gcd(out_channels, groups))
-    fft_conv_layer = _FFTConv(
+    fft_conv_layer = [FFTConv1d, FFTConv2d, FFTConv3d][ndim - 1](
         in_channels=in_channels,
         out_channels=out_channels,
         kernel_size=kernel_size,
@@ -41,7 +41,6 @@ def test_fft_conv_module(
         dilation=dilation,
         groups=groups,
         bias=bias,
-        ndim=ndim,
     )
     batch_size = 2  # TODO: Make this non-constant?
     dims = ndim * [input_size]
@@ -87,7 +86,7 @@ def test_fft_conv_backward_module(
 ):
     torch_conv = getattr(f, f"conv{ndim}d")
     groups = _gcd(in_channels, _gcd(out_channels, groups))
-    fft_conv_layer = _FFTConv(
+    fft_conv_layer = [FFTConv1d, FFTConv2d, FFTConv3d][ndim - 1](
         in_channels=in_channels,
         out_channels=out_channels,
         kernel_size=kernel_size,
@@ -96,7 +95,6 @@ def test_fft_conv_backward_module(
         dilation=dilation,
         groups=groups,
         bias=bias,
-        ndim=ndim,
     )
     batch_size = 2  # TODO: Make this non-constant?
     dims = ndim * [input_size]
