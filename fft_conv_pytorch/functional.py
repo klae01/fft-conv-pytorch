@@ -1,7 +1,7 @@
 from typing import Iterable, Tuple, Union
 
 import torch
-import torch.nn.functional as f
+import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.fft import irfftn, rfftn
 
@@ -46,19 +46,20 @@ def fft_conv(
     stride_ = to_ntuple(stride, n=n)
     dilation_ = to_ntuple(dilation, n=n)
 
-    # internal dilation offsets
-    offset = torch.zeros(1, 1, *dilation_, device=signal.device, dtype=signal.dtype)
-    offset[(slice(None), slice(None), *((0,) * n))] = 1.0
-
-    # correct the kernel by cutting off unwanted dilation trailing zeros
-    cutoff = tuple(slice(None, -d + 1 if d != 1 else None) for d in dilation_)
-
-    # pad the kernel internally according to the dilation parameters
-    kernel = torch.kron(kernel, offset)[(slice(None), slice(None)) + cutoff]
+    if any(x != 1 for x in dilation_):
+        kernel_ = kernel.new_zeros(
+            list(kernel.shape[:2])
+            + [(k - 1) * d + 1 for k, d in zip(kernel.shape[2:], dilation_)]
+        )
+        kernel_[
+            (slice(None), slice(None), *(slice(None, None, d) for d in dilation_))
+        ] = kernel
+        kernel = kernel_
 
     # Pad the input signal & kernel tensors
-    signal_padding = [p for p in padding_[::-1] for _ in range(2)]
-    signal = f.pad(signal, signal_padding, mode=padding_mode)
+    if any(x != 0 for x in padding_):
+        signal_padding = [p for p in padding_[::-1] for _ in range(2)]
+        signal = F.pad(signal, signal_padding, mode=padding_mode)
 
     # Because PyTorch computes a *one-sided* FFT, we need the final dimension to
     # have *even* length.  Just pad with one more zero if the final dimension is odd.
@@ -72,11 +73,13 @@ def fft_conv(
     output = irfftn(output_fr, dim=tuple(range(2, signal.ndim)))
 
     # Remove extra padded values
-    crop_slices = [slice(0, output.size(0)), slice(0, output.size(1))] + [
-        slice(0, (signal.size(i) - kernel.size(i) + 1), stride_[i - 2])
-        for i in range(2, signal.ndim)
+    output = output[
+        [slice(0, output.size(0)), slice(0, output.size(1))]
+        + [
+            slice(0, (signal.size(i) - kernel.size(i) + 1), stride_[i - 2])
+            for i in range(2, signal.ndim)
+        ]
     ]
-    output = output[crop_slices].contiguous()
 
     # Optionally, add a bias term before returning.
     if bias is not None:
