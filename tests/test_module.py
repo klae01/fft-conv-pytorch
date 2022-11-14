@@ -72,6 +72,7 @@ def test_fft_conv_module(
 @pytest.mark.parametrize("bias", [True])
 @pytest.mark.parametrize("ndim", [1, 2, 3])
 @pytest.mark.parametrize("input_size", [7, 8])
+@pytest.mark.parametrize("low_memory", [True, False])
 def test_fft_conv_backward_module(
     in_channels: int,
     out_channels: int,
@@ -83,6 +84,7 @@ def test_fft_conv_backward_module(
     bias: bool,
     ndim: int,
     input_size: int,
+    low_memory: int,
 ):
     torch_conv = getattr(f, f"conv{ndim}d")
     groups = _gcd(in_channels, _gcd(out_channels, groups))
@@ -96,6 +98,7 @@ def test_fft_conv_backward_module(
         groups=groups,
         bias=bias,
     )
+    fft_conv_layer.set_memory_optimize(low_memory)
     batch_size = 2  # TODO: Make this non-constant?
     dims = ndim * [input_size]
     signal = torch.randn(batch_size, in_channels, *dims)
