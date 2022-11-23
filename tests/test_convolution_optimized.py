@@ -17,7 +17,7 @@ from fft_conv_pytorch.optimized import fft_conv, to_ntuple
 @pytest.mark.parametrize("stride", [1, 2])
 @pytest.mark.parametrize("dilation", [1, 2])
 @pytest.mark.parametrize("bias", [True])
-@pytest.mark.parametrize("ndim", [2])
+@pytest.mark.parametrize("ndim", [1, 2, 3])
 @pytest.mark.parametrize("input_size", [7, 8])
 def test_fft_conv_functional(
     blocksize: int,
@@ -70,7 +70,7 @@ def test_fft_conv_functional(
 @pytest.mark.parametrize("stride", [1, 2])
 @pytest.mark.parametrize("dilation", [1, 2])
 @pytest.mark.parametrize("bias", [True])
-@pytest.mark.parametrize("ndim", [2])
+@pytest.mark.parametrize("ndim", [1, 2, 3])
 @pytest.mark.parametrize("input_size", [7, 8])
 def test_fft_conv_backward_functional(
     blocksize: int,

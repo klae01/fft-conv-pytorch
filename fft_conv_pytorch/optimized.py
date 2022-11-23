@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.fft import irfftn, rfftn
 
+from .functional import complex_matmul
 from .utils import to_ntuple
 
 
@@ -104,12 +105,45 @@ def opt_blocksize(input_size, kernel_size, speed_impt=0.5):
     return block_size[::-1]
 
 
-def complex_matmul(a: Tensor, b: Tensor, groups: int = 1) -> Tensor:
-    return torch.einsum(
-        "bgi...f,goi...->bgo...f",
-        a.unflatten(1, [groups, a.size(1) // groups]),  # B G C ...
-        b.unflatten(0, [groups, b.size(0) // groups]),  # G OC IC ...
-    ).flatten(1, 2)
+def Dblock(tensor: Tensor, blocksize: Iterable[int], active_blocksize: Iterable[int]):
+    n = tensor.ndim - 2
+    S = list(tensor.shape)
+    B = list(blocksize)
+    A = list(active_blocksize)
+    T = list(tensor.stride())
+    size = S[:2]
+    stride = T[:2]
+    for s, b, a, t in zip(S[2:], B, A, T[2:]):
+        size.append((s - a) // b + 1)
+        stride.append(t * b)
+        size.append(a)
+        stride.append(t)
+    reorder, wait = [], []
+    for i in range(n * 2 + 2):
+        if i < 2 or i % 2 == 0:
+            reorder.append(i)
+        else:
+            wait.append(i)
+    reorder += wait
+    return tensor.as_strided(size, stride, tensor.storage_offset()).permute(reorder)
+
+
+def Mblock(tensor: Tensor):
+    n = (tensor.ndim - 2) // 2
+    q1 = list(range(n + 2))
+    q2 = list(range(n + 2, n * 2 + 2))
+    reorder = []
+    while q1 or q2:
+        if q2:
+            reorder.append(q2.pop())
+        if q1:
+            reorder.append(q1.pop())
+    tensor = tensor.permute(reorder[::-1])
+    S = list(tensor.shape)
+    for i in range(2, 2 + n):
+        S[i] = S[i] * S[i + 1]
+        S.pop(i + 1)
+    return tensor.reshape(S)
 
 
 def fft_conv(
@@ -151,9 +185,7 @@ def fft_conv(
             list(kernel.shape[:2])
             + [(k - 1) * d + 1 for k, d in zip(kernel.shape[2:], dilation_)]
         )
-        kernel_[
-            (slice(None), slice(None), *(slice(None, None, d) for d in dilation_))
-        ] = kernel
+        kernel_[[slice(None)] * 2 + [slice(None, None, d) for d in dilation_]] = kernel
         kernel = kernel_
 
     blocksize = (
@@ -181,25 +213,16 @@ def fft_conv(
         [x for p, gp in zip(padding_, GP) for x in [p + gp, p]][::-1],
         padding_mode,
     )
-    SP = np.asarray(signal_pad.shape[2:])
-    unfold_signal = torch.nn.functional.unfold(
-        signal_pad,
-        kernel_size=BS.tolist(),
-        stride=B.tolist(),
-    ).unflatten(1, [signal.size(1)] + BS.tolist())
+    block_signal = Dblock(signal_pad, B, BS)
+    for _ in range(n):
+        kernel = kernel.unsqueeze(2)
 
-    signal_fr = rfftn(unfold_signal, FFTss.tolist(), dim=tuple(range(2, n + 2)))
-    kernel_fr = rfftn(kernel, FFTss.tolist(), dim=tuple(range(2, n + 2)))
+    signal_fr = rfftn(block_signal, BS.tolist(), dim=tuple(range(-n, 0)))
+    kernel_fr = rfftn(kernel, BS.tolist(), dim=tuple(range(-n, 0)))
     output_fr = complex_matmul(signal_fr, kernel_fr.conj(), groups=groups)
-    output = irfftn(output_fr, FFTss.tolist(), dim=tuple(range(2, n + 2)))
-    output = output[[slice(None)] * 2 + [slice(None, b) for b in B]]
-    output = torch.nn.functional.fold(
-        output.flatten(1, n + 1),
-        output_size=(((SP - BS) // B + 1) * B).tolist(),
-        kernel_size=B.tolist(),
-        padding=0,
-        stride=B.tolist(),
-    )
+    output = irfftn(output_fr, BS.tolist(), dim=tuple(range(-n, 0)))
+    output = output[[slice(None)] * (2 + n) + [slice(None, b) for b in B]]
+    output = Mblock(output)
     output = output[[slice(None)] * 2 + [slice(None, t, s) for t, s in zip(TRG, ST)]]
 
     # Optionally, add a bias term before returning.

@@ -1,5 +1,8 @@
+import gc
+import time
+from contextlib import contextmanager
 from timeit import Timer
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, Tuple
 
 import numpy as np
 import torch
@@ -17,13 +20,34 @@ class Benchmark(NamedTuple):
         return f"({self.mean:.3e} \u00B1 {self.std:.3e}) s"
 
 
-def benchmark(fn: Callable, *args, num_iterations: int = 10, **kwargs) -> Benchmark:
-    timer = Timer(
-        "fn(*args, **kwargs)",
-        globals={"fn": fn, "args": args, "kwargs": kwargs},
+@contextmanager
+def measure():
+    gc.collect()
+    torch.cuda.reset_max_memory_allocated()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    result = dict()
+    begin = time.time()
+    try:
+        yield result
+    finally:
+        torch.cuda.synchronize()
+        result["time"] = time.time() - begin
+        result["memory"] = torch.cuda.max_memory_allocated() / 2**30
+
+
+def benchmark(
+    fn: Callable, *args, num_iterations: int = 10, **kwargs
+) -> Tuple[Benchmark, Benchmark]:
+    time, memory = [], []
+    for i in range(num_iterations):
+        with measure() as r:
+            fn(*args, **kwargs)
+        time.append(r.get("time"))
+        memory.append(r.get("memory"))
+    return Benchmark(np.mean(time[1:]).item(), np.std(time[1:]).item()), Benchmark(
+        np.mean(memory[1:]).item(), np.std(memory[1:]).item()
     )
-    times = timer.repeat(number=1, repeat=num_iterations + 1)
-    return Benchmark(np.mean(times[1:]).item(), np.std(times[1:]).item())
 
 
 def _assert_almost_equal(x: Tensor, y: Tensor) -> bool:
