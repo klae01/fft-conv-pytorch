@@ -1,3 +1,4 @@
+from collections import defaultdict
 from functools import lru_cache
 from typing import Iterable, Tuple, Union
 
@@ -10,32 +11,92 @@ from torch.fft import irfftn, rfftn
 from .utils import to_ntuple
 
 
+class prod:
+    def __init__(self):
+        self.items = defaultdict(lambda: 1)
+        self.index = 0
+
+    def reset(self):
+        self.index = 0
+
+    def put(self, x):
+        self.items[self.index] = self.items[self.index] * x
+        self.index += 1
+
+    def get(self):
+        value = self.items[self.index]
+        self.index += 1
+        return value
+
+
+class accm(prod):
+    def __init__(self):
+        self.items = defaultdict(lambda: 0)
+        self.index = 0
+
+    def put(self, x):
+        self.items[self.index] = self.items[self.index] + x
+        self.index += 1
+
+
 @lru_cache(1024)
 def opt_blocksize(input_size, kernel_size, speed_impt=0.5):
-    def prod(X):
-        result = X[0]
-        for x in X[1:]:
-            result = result * x
-        return result
+    K = np.asarray(kernel_size[2:])
+    S = np.asarray(input_size[2:])
 
-    kernel_cost = []
-    signal_cost = []
-    logs = []
-    for i, (s, k) in enumerate(zip(input_size[2:], kernel_size[2:])):
+    cost = prod()
+    log_cost = accm()
+    cost.put(np.prod(kernel_size[:2]))
+    cost.put(np.prod(input_size[:2]))
+    cost.put(input_size[0] * np.prod(kernel_size[:2]))
+    cost.put(input_size[0] * kernel_size[0])
+
+    cost.put(np.prod(kernel_size[:2]))
+    cost.put(np.prod(input_size[:2]))
+    cost.put(input_size[0] * kernel_size[0])
+    cost.put(input_size[0] * kernel_size[0])
+
+    for i, (s, k) in enumerate(zip(S, K)):
         shape = [1] * (len(input_size) - 2)
         shape[i] = -1
-        padding = k // 2 * 2
-        block_size = np.arange(1, s + 1).reshape(*shape)
-        block_count = (s - 1) // block_size + 1
-        log = np.ceil(np.log2(block_size + padding))
-        kernel_cost.append(2**log)
-        signal_cost.append(block_count * 2**log)
-        logs.append(log + 1)
-    memo = prod(input_size[:2]) * prod(signal_cost)
-    memo += prod(kernel_size[:2]) * prod(kernel_cost)
-    time = memo * sum(logs)
-    tradoff = time ** (speed_impt) * memo ** (1 - speed_impt)
+        B = np.arange(1, s + 1).reshape(*shape)
+
+        BS = B + k - 1  # active block size
+        GP = (s - k) // B * B + BS - s  # Global padding
+        BC = (s + GP) // B
+        log = np.ceil(np.log2(BS))
+        kernel_cost = 2**log
+        signal_cost = BC * 2**log
+
+        cost.reset()
+        log_cost.reset()
+
+        log_cost.put(log)
+        cost.put(kernel_cost)
+        cost.put(signal_cost)
+        cost.put(BC * BS)
+        cost.put(signal_cost)
+
+        cost.put(kernel_cost)
+        cost.put(signal_cost)
+        cost.put(BC * BS)
+        cost.put(signal_cost)
+    cost.reset()
+    log_cost.reset()
+
+    log_cost = log_cost.get()
+    time_cost = [cost.get() for _ in range(4)]
+    time_cost[0] *= log_cost
+    time_cost[1] *= log_cost
+    time_cost[3] *= log_cost
+    time_cost = sum(time_cost)
+
+    memo_cost = [cost.get() for _ in range(4)]
+    memo_cost = sum(memo_cost)
+
+    tradoff = time_cost ** (speed_impt) * memo_cost ** (1 - speed_impt)
     index = np.argmin(tradoff)
+
     block_size = []
     for s in input_size[2:][::-1]:
         block_size.append(index % s + 1)
@@ -111,7 +172,7 @@ def fft_conv(
     ST = np.asarray(list(stride_), dtype=np.int64)
     PD = np.asarray(list(padding_), dtype=np.int64)
     BS = B + K - 1  # active block size
-    GP = ((S + 2 * PD) - 1) // B * B + BS - S  # Global padding
+    GP = (S + 2 * PD - K) // B * B + BS - S  # Global padding
     FFTss = (BS + 1) // 2 * 2  # fft signal size
     TRG = S + PD * 2 - K + 1  # target output shape
 
@@ -123,8 +184,8 @@ def fft_conv(
     SP = np.asarray(signal_pad.shape[2:])
     unfold_signal = torch.nn.functional.unfold(
         signal_pad,
-        kernel_size=BS,
-        stride=B,
+        kernel_size=BS.tolist(),
+        stride=B.tolist(),
     ).unflatten(1, [signal.size(1)] + BS.tolist())
 
     signal_fr = rfftn(unfold_signal, FFTss.tolist(), dim=tuple(range(2, n + 2)))
@@ -134,10 +195,10 @@ def fft_conv(
     output = output[[slice(None)] * 2 + [slice(None, b) for b in B]]
     output = torch.nn.functional.fold(
         output.flatten(1, n + 1),
-        output_size=((SP - BS) // B + 1) * B,
-        kernel_size=B,
+        output_size=(((SP - BS) // B + 1) * B).tolist(),
+        kernel_size=B.tolist(),
         padding=0,
-        stride=B,
+        stride=B.tolist(),
     )
     output = output[[slice(None)] * 2 + [slice(None, t, s) for t, s in zip(TRG, ST)]]
 

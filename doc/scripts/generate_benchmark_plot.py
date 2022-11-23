@@ -30,13 +30,15 @@ def _get_conv_inputs(
     out_channels: int = 8,
 ):
     dims = ndim * [input_size]
-    signal = torch.randn(batch_size, in_channels, *dims)
+    signal = torch.randn(batch_size, in_channels, *dims, device="cuda")
 
     kernel_size = to_ntuple(kernel_size, n=signal.ndim - 2)
-    weight = torch.randn(out_channels, in_channels, *kernel_size, requires_grad=True)
-    bias = torch.randn(out_channels, requires_grad=True)
+    weight = torch.randn(
+        out_channels, in_channels, *kernel_size, requires_grad=True, device="cuda"
+    )
+    bias = torch.randn(out_channels, requires_grad=True, device="cuda")
 
-    return signal.cuda(), weight.cuda(), bias.cuda()
+    return signal, weight, bias
 
 
 def benchmark_conv(
