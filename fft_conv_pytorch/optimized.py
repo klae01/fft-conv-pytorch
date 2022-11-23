@@ -96,13 +96,9 @@ def opt_blocksize(input_size, kernel_size, speed_impt=0.5):
     memo_cost = sum(memo_cost)
 
     tradoff = time_cost ** (speed_impt) * memo_cost ** (1 - speed_impt)
-    index = np.argmin(tradoff)
-
-    block_size = []
-    for s in input_size[2:][::-1]:
-        block_size.append(index % s + 1)
-        index //= s
-    return block_size[::-1]
+    index = (tradoff == np.min(tradoff)).nonzero()
+    index = sorted(zip(*index))[0]
+    return [I + 1 for I in index]
 
 
 def Dblock(tensor: Tensor, blocksize: Iterable[int], active_blocksize: Iterable[int]):
@@ -205,7 +201,7 @@ def fft_conv(
     PD = np.asarray(list(padding_), dtype=np.int64)
     BS = B + K - 1  # active block size
     GP = (S + 2 * PD - K) // B * B + BS - S  # Global padding
-    FFTss = (BS + 1) // 2 * 2  # fft signal size
+    FFTss = BS  # fft signal size
     TRG = S + PD * 2 - K + 1  # target output shape
 
     signal_pad = F.pad(
@@ -217,10 +213,10 @@ def fft_conv(
     for _ in range(n):
         kernel = kernel.unsqueeze(2)
 
-    signal_fr = rfftn(block_signal, BS.tolist(), dim=tuple(range(-n, 0)))
-    kernel_fr = rfftn(kernel, BS.tolist(), dim=tuple(range(-n, 0)))
+    signal_fr = rfftn(block_signal, FFTss.tolist(), dim=tuple(range(-n, 0)))
+    kernel_fr = rfftn(kernel, FFTss.tolist(), dim=tuple(range(-n, 0)))
     output_fr = complex_matmul(signal_fr, kernel_fr.conj(), groups=groups)
-    output = irfftn(output_fr, BS.tolist(), dim=tuple(range(-n, 0)))
+    output = irfftn(output_fr, FFTss.tolist(), dim=tuple(range(-n, 0)))
     output = output[[slice(None)] * (2 + n) + [slice(None, b) for b in B]]
     output = Mblock(output)
     output = output[[slice(None)] * 2 + [slice(None, t, s) for t, s in zip(TRG, ST)]]
