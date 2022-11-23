@@ -9,7 +9,9 @@ from matplotlib.ticker import MaxNLocator
 from tqdm import tqdm
 
 from fft_conv_pytorch.benchmark_utils import Benchmark, benchmark
-from fft_conv_pytorch.functional import fft_conv, fft_conv_transpose, to_ntuple
+from fft_conv_pytorch import functional, optimized
+
+to_ntuple = functional.to_ntuple
 
 
 def cuda_sync(func, *args, **kwargs):
@@ -41,16 +43,14 @@ def benchmark_conv(
     ndim: int,
     input_size: int,
     kernel_size: int,
-    fft: bool = True,
     method: Callable = None,
     num_iterations: int = 10,
 ):
-    conv_fn = method if fft else getattr(f, f"{method.__name__[4:]}{ndim}d")
     signal, weight, bias = _get_conv_inputs(
         ndim=ndim, input_size=input_size, kernel_size=kernel_size
     )
     return benchmark(
-        partial(cuda_sync, conv_fn),
+        partial(cuda_sync, method),
         signal,
         weight,
         bias=bias,
@@ -62,7 +62,6 @@ def benchmark_kernel_size(
     kernel_sizes: Sequence[int],
     ndim: int,
     input_size: int,
-    fft: bool = True,
     method: Callable = None,
     num_iterations: int = 10,
     desc: str = "",
@@ -73,7 +72,6 @@ def benchmark_kernel_size(
         benchmark_conv,
         ndim=ndim,
         input_size=input_size,
-        fft=fft,
         method=method,
         num_iterations=num_iterations,
     )
@@ -84,16 +82,15 @@ def _plot_benchmarks(
     benchmarks: List[Benchmark],
     config: Dict,
     ax: plt.Axes,
-    color: str,
     linestyle: str,
     label: Optional[str] = None,
 ):
     xs = config["kernel_sizes"]
     ys = np.array([b.mean * 1000 for b in benchmarks])
     std = np.array([b.std * 1000 for b in benchmarks])
-    ax.plot(xs, ys, color, linestyle=linestyle, label=label)
+    line, *_ = ax.plot(xs, ys, linestyle, label=label)
     ax.fill_between(
-        xs, ys - std, ys + std, facecolor=color, alpha=0.25, label="_nolegend_"
+        xs, ys - std, ys + std, facecolor=linestyle[-1], alpha=0.25, label="_nolegend_"
     )
 
     ndim = config["ndim"]
@@ -102,6 +99,15 @@ def _plot_benchmarks(
     ax.set_xlabel(f"Kernel Size {kernel_size_str}")
     ax.set_yscale("log")
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    return line
+
+
+def naive_conv(input, weight, *args, **kwargs):
+    return getattr(f, f"conv{weight.ndim-2}d")(input, weight, *args, **kwargs)
+
+
+def naive_conv_transpose(input, weight, *args, **kwargs):
+    return getattr(f, f"conv_transpose{weight.ndim-2}d")(input, weight, *args, **kwargs)
 
 
 if __name__ == "__main__":
@@ -129,35 +135,32 @@ if __name__ == "__main__":
     ]
 
     save_dir = os.path.join(os.path.dirname(__file__), os.path.pardir)
-    fig, ax = plt.subplots(1, 3, figsize=(4 * len(configs), 4), squeeze=False)
+    fig, ax = plt.subplots(1, 3, figsize=(5 * 3, 4), squeeze=False)
+    handles = dict()
 
-    for method in [fft_conv_transpose, fft_conv]:
+    for label, (method, linestyle) in dict(
+        naive_fft_conv_transpose=[functional.fft_conv_transpose, "s--b"],
+        naive_fft_conv=[functional.fft_conv, "o-b"],
+        optimized_fft_conv=[optimized.fft_conv, "o-r"],
+        naive_conv=[naive_conv, "o-g"],
+        naive_conv_transpose=[naive_conv_transpose, "s--g"],
+    ).items():
         for i, config in enumerate(configs):
-            work_type = method.__name__[4:]
-            linestyle = [None, "--"]["transpose" in work_type]
-            fft = benchmark_kernel_size(
-                fft=True, **config, method=method, desc=f"FFT {config['ndim']}D"
-            )
-            _plot_benchmarks(
-                fft,
-                config=config,
-                ax=ax[0, config["ndim"] - 1],
-                color="r",
-                linestyle=linestyle,
-                label=f"fft_{work_type}",
-            )
-
-            direct = benchmark_kernel_size(
-                fft=False, **config, method=method, desc=f"Direct {config['ndim']}D"
-            )
-            _plot_benchmarks(
-                direct,
-                config=config,
-                ax=ax[0, config["ndim"] - 1],
-                color="b",
-                linestyle=linestyle,
-                label=f"native_{work_type}",
-            )
+            try:
+                result = benchmark_kernel_size(
+                    **config, method=method, desc=f"{label} {config['ndim']}D"
+                )
+                handles[label] = _plot_benchmarks(
+                    result,
+                    config=config,
+                    ax=ax[0, config["ndim"] - 1],
+                    linestyle=linestyle,
+                    label=label,
+                )
+            except Exception as e:
+                print(e)
     ax[0, 0].set_ylabel("Execution Time (ms)")
-    ax[0, 2].legend()
+    fig.tight_layout()
+    fig.subplots_adjust(right=0.82)
+    fig.legend(handles.values(), handles.keys(), loc="center right")
     plt.savefig(os.path.join(save_dir, "benchmark.png"))
