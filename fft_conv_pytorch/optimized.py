@@ -12,88 +12,39 @@ from .functional import complex_matmul
 from .utils import to_ntuple
 
 
-class prod:
-    def __init__(self):
-        self.items = defaultdict(lambda: 1)
-        self.index = 0
-
-    def reset(self):
-        self.index = 0
-
-    def put(self, x):
-        self.items[self.index] = self.items[self.index] * x
-        self.index += 1
-
-    def get(self):
-        value = self.items[self.index]
-        self.index += 1
-        return value
-
-
-class accm(prod):
-    def __init__(self):
-        self.items = defaultdict(lambda: 0)
-        self.index = 0
-
-    def put(self, x):
-        self.items[self.index] = self.items[self.index] + x
-        self.index += 1
-
-
 @lru_cache(1024)
 def opt_blocksize(input_size, kernel_size, speed_impt=0.5):
     K = np.asarray(kernel_size[2:])
     S = np.asarray(input_size[2:])
+    n = len(K)
+    ops_size = (np.ceil(np.log2(S)) + 1).tolist() + [2] * n
+    c_info = np.ones(ops_size, dtype=np.int64)
+    s_info = np.ones(ops_size, dtype=np.int64)
+    for i, (k, s) in enumerate(zip(K, S)):
+        shape = [[1, -1][dim == i] for dim in range(n * 2)][:-1]
+        core_size = 2 ** np.arange(np.ceil(np.log2(s)) + 1).reshape(shape)
+        misc_size = 2 ** np.ceil(np.log2((k - 1) * 2)).reshape(shape)
+        core_count = np.ceil(s / core_size)
+        misc_count = core_count - 1
+        s_info[ [[slice(None), 0][dim == n + i] for dim in range(n * 2)] ] *= core_size
+        s_info[ [[slice(None), 1][dim == n + i] for dim in range(n * 2)] ] *= misc_size
+        c_info[ [[slice(None), 0][dim == n + i] for dim in range(n * 2)] ] *= core_count
+        c_info[ [[slice(None), 1][dim == n + i] for dim in range(n * 2)] ] *= misc_count
+    case_axis = tuple(range(-n, 0))
 
-    cost = prod()
-    log_cost = accm()
-    cost.put(np.prod(kernel_size[:2]))
-    cost.put(np.prod(input_size[:2]))
-    cost.put(input_size[0] * np.prod(kernel_size[:2]))
-    cost.put(input_size[0] * kernel_size[0])
+    case_kernel_size = s_info[[slice(None)] * n + [0] * n]
+    case_memory_sum = (c_info * s_info).sum(case_axis)
+    case_time_sum = (c_info * s_info * np.ceil(np.log2(s_info))).sum(case_axis)
 
-    cost.put(np.prod(kernel_size[:2]))
-    cost.put(np.prod(input_size[:2]))
-    cost.put(input_size[0] * kernel_size[0])
-    cost.put(input_size[0] * kernel_size[0])
+    time_cost = np.prod(kernel_size[:2]) * case_kernel_size * np.log2(case_kernel_size)
+    time_cost += np.prod(input_size[:2]) * case_time_sum
+    time_cost += input_size[0] * np.prod(kernel_size[:2]) * case_memory_sum
+    time_cost += input_size[0] * kernel_size[0] * case_time_sum
 
-    for i, (s, k) in enumerate(zip(S, K)):
-        shape = [1] * (len(input_size) - 2)
-        shape[i] = -1
-        B = np.arange(1, s + 1).reshape(*shape)
-
-        BS = B + k - 1  # active block size
-        GP = (s - k) // B * B + BS - s  # Global padding
-        BC = (s + GP) // B
-        log = np.ceil(np.log2(BS))
-        kernel_cost = 2**log
-        signal_cost = BC * 2**log
-
-        cost.reset()
-        log_cost.reset()
-
-        log_cost.put(log)
-        cost.put(kernel_cost)
-        cost.put(signal_cost)
-        cost.put(BC * BS)
-        cost.put(signal_cost)
-
-        cost.put(kernel_cost)
-        cost.put(signal_cost)
-        cost.put(BC * BS)
-        cost.put(signal_cost)
-    cost.reset()
-    log_cost.reset()
-
-    log_cost = log_cost.get()
-    time_cost = [cost.get() for _ in range(4)]
-    time_cost[0] *= log_cost
-    time_cost[1] *= log_cost
-    time_cost[3] *= log_cost
-    time_cost = sum(time_cost)
-
-    memo_cost = [cost.get() for _ in range(4)]
-    memo_cost = sum(memo_cost)
+    memo_cost = np.prod(kernel_size[:2]) * case_kernel_size
+    memo_cost += np.prod(input_size[:2]) * case_memory_sum
+    memo_cost += input_size[0] * kernel_size[0] * case_memory_sum
+    memo_cost += input_size[0] * kernel_size[0] * case_memory_sum
 
     tradoff = time_cost ** (speed_impt) * memo_cost ** (1 - speed_impt)
     index = (tradoff == np.min(tradoff)).nonzero()
