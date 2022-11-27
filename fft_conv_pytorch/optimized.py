@@ -57,14 +57,17 @@ def opt_blocksize(input_size, kernel_size, speed_impt=0.5):
     cost.put(input_size[0] * kernel_size[0])
     cost.put(input_size[0] * kernel_size[0])
 
+    size_candidate = []
     for i, (s, k) in enumerate(zip(S, K)):
         shape = [1] * (len(input_size) - 2)
         shape[i] = -1
-        B = np.arange(1, s + 1).reshape(*shape)
+        B_candid = np.arange(1, s + 1)
+        size_candidate.append(B_candid)
+        B = B_candid.reshape(*shape)
 
         BS = B + k - 1  # active block size
         GP = (s - k) // B * B + BS - s  # Global padding
-        BC = (s + GP) // B
+        BC = (s - k + 1 + GP) // B
         log = np.ceil(np.log2(BS))
         kernel_cost = 2**log
         signal_cost = BC * 2**log
@@ -97,8 +100,7 @@ def opt_blocksize(input_size, kernel_size, speed_impt=0.5):
 
     tradoff = time_cost ** (speed_impt) * memo_cost ** (1 - speed_impt)
     index = (tradoff == np.min(tradoff)).nonzero()
-    index = sorted(zip(*index))[0]
-    return [I + 1 for I in index]
+    return list(map(lambda x, y: x[y], size_candidate, sorted(zip(*index))[0]))
 
 
 def Dblock(tensor: Tensor, blocksize: Iterable[int], active_blocksize: Iterable[int]):
