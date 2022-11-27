@@ -12,95 +12,56 @@ from .functional import complex_matmul
 from .utils import to_ntuple
 
 
-class prod:
-    def __init__(self):
-        self.items = defaultdict(lambda: 1)
-        self.index = 0
+def blocksize_candidate(start, end):
+    def _sub(x):
+        for p in [2, 3, 5, 7]:
+            while x % p == 0:
+                x //= p
+        return x == 1
 
-    def reset(self):
-        self.index = 0
-
-    def put(self, x):
-        self.items[self.index] = self.items[self.index] * x
-        self.index += 1
-
-    def get(self):
-        value = self.items[self.index]
-        self.index += 1
-        return value
-
-
-class accm(prod):
-    def __init__(self):
-        self.items = defaultdict(lambda: 0)
-        self.index = 0
-
-    def put(self, x):
-        self.items[self.index] = self.items[self.index] + x
-        self.index += 1
+    return [v for v in range(start, end + 1) if _sub(v)]
 
 
 @lru_cache(1024)
 def opt_blocksize(input_size, kernel_size, speed_impt=0.5):
     K = np.asarray(kernel_size[2:])
     S = np.asarray(input_size[2:])
+    n = len(K)
 
-    cost = prod()
-    log_cost = accm()
-    cost.put(np.prod(kernel_size[:2]))
-    cost.put(np.prod(input_size[:2]))
-    cost.put(input_size[0] * np.prod(kernel_size[:2]))
-    cost.put(input_size[0] * kernel_size[0])
+    size_candidate = list(map(blocksize_candidate, K, S * 7))
+    ops_size = list(map(len, size_candidate))
+    c_info = np.ones(ops_size, dtype=np.float64)
+    e_info = np.zeros(ops_size, dtype=np.float64)
+    s_info = np.ones(ops_size, dtype=np.float64)
 
-    cost.put(np.prod(kernel_size[:2]))
-    cost.put(np.prod(input_size[:2]))
-    cost.put(input_size[0] * kernel_size[0])
-    cost.put(input_size[0] * kernel_size[0])
-
-    size_candidate = []
-    for i, (s, k) in enumerate(zip(S, K)):
-        shape = [1] * (len(input_size) - 2)
+    for i, (k, s, bs) in enumerate(zip(K, S, size_candidate)):
+        shape = [1] * n
         shape[i] = -1
-        B_candid = np.arange(1, s + 1)
-        size_candidate.append(B_candid)
-        B = B_candid.reshape(*shape)
-
-        BS = B + k - 1  # active block size
+        BS = np.asarray(bs).reshape(shape)
+        B = BS - k + 1  # valid size
         GP = (s - k) // B * B + BS - s  # Global padding
         BC = (s - k + 1 + GP) // B
-        log = np.ceil(np.log2(BS))
-        kernel_cost = 2**log
-        signal_cost = BC * 2**log
+        c_info *= BC
+        e_info += np.ceil(np.log2(BS))
+        s_info *= BS
 
-        cost.reset()
-        log_cost.reset()
+    # Assume cuFFT is as follows:
+    # time complexity = n ⌈log2 n⌉
+    # memory complexity = 2 ^ ⌈log2 n⌉
+    time_cost = np.prod(kernel_size[:2]) * s_info * e_info
+    time_cost += np.prod(input_size[:2]) * c_info * s_info * e_info
+    time_cost += input_size[0] * np.prod(kernel_size[:2]) * c_info * s_info
+    time_cost += input_size[0] * kernel_size[0] * c_info * s_info * e_info
 
-        log_cost.put(log)
-        cost.put(kernel_cost)
-        cost.put(signal_cost)
-        cost.put(BC * BS)
-        cost.put(signal_cost)
-
-        cost.put(kernel_cost)
-        cost.put(signal_cost)
-        cost.put(BC * BS)
-        cost.put(signal_cost)
-    cost.reset()
-    log_cost.reset()
-
-    log_cost = log_cost.get()
-    time_cost = [cost.get() for _ in range(4)]
-    time_cost[0] *= log_cost
-    time_cost[1] *= log_cost
-    time_cost[3] *= log_cost
-    time_cost = sum(time_cost)
-
-    memo_cost = [cost.get() for _ in range(4)]
-    memo_cost = sum(memo_cost)
+    memo_cost = np.prod(kernel_size[:2]) * 2**e_info
+    memo_cost += np.prod(input_size[:2]) * c_info * 2**e_info
+    memo_cost += input_size[0] * kernel_size[0] * c_info * s_info
+    memo_cost += input_size[0] * kernel_size[0] * c_info * 2**e_info
 
     tradoff = time_cost ** (speed_impt) * memo_cost ** (1 - speed_impt)
     index = (tradoff == np.min(tradoff)).nonzero()
-    return list(map(lambda x, y: x[y], size_candidate, sorted(zip(*index))[0]))
+    index = sorted(zip(*index))[0]
+    return list(map(lambda x, y, z: x[y] - z + 1, size_candidate, index, K))
 
 
 def Dblock(tensor: Tensor, blocksize: Iterable[int], active_blocksize: Iterable[int]):
