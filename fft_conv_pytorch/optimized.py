@@ -12,27 +12,49 @@ from .functional import complex_matmul
 from .utils import to_ntuple
 
 
-def blocksize_candidate(start, end):
-    def _sub(x):
-        for p in [2, 3, 5, 7]:
-            while x % p == 0:
-                x //= p
-        return x == 1
+def __blocksize_candidate(end):
+    if __blocksize_candidate.scan < end:
+        P = [2, 3, 5, 7]
+        C = []
+        for p in P:
+            E = np.floor(np.log(end) / np.log(p)).astype(np.int64)
+            C.append(p ** np.arange(E + 1))
+        C = np.concatenate([(c1[:, None] * c2).flatten() for c1 in C for c2 in C])
+        __blocksize_candidate.scan = end
+        __blocksize_candidate.cache = np.sort(C)
+    return __blocksize_candidate.cache
 
-    return [v for v in range(start, end + 1) if _sub(v)]
+
+__blocksize_candidate.scan = -1
+__blocksize_candidate.cache = None
+__blocksize_candidate(2**16)
+
+
+def blocksize_candidate(start, end):
+    C = __blocksize_candidate(end)
+    return C[slice(*np.searchsorted(C, [start, end + 1]))]
 
 
 @lru_cache(1024)
-def opt_blocksize(input_size, kernel_size, speed_impt=0.5):
+def opt_blocksize(
+    input_size,
+    kernel_size,
+    speed_impt=0.5,
+    real_input=True,
+    padpenalty=True,
+    backward=True,
+):
     K = np.asarray(kernel_size[2:])
     S = np.asarray(input_size[2:])
     n = len(K)
 
     size_candidate = list(map(blocksize_candidate, K, S * 7))
     ops_size = list(map(len, size_candidate))
-    c_info = np.ones(ops_size, dtype=np.float64)
-    e_info = np.zeros(ops_size, dtype=np.float64)
-    s_info = np.ones(ops_size, dtype=np.float64)
+    c_info = np.ones(ops_size, dtype=np.float64)  # block count
+    e_info = np.zeros(ops_size, dtype=np.float64)  # log of block size
+    s_info = np.ones(ops_size, dtype=np.float64)  # block size
+    p_info = np.ones(ops_size, dtype=np.float64)  # plane
+    d_info = np.zeros(ops_size + [n], dtype=np.float64)  # padding
 
     for i, (k, s, bs) in enumerate(zip(K, S, size_candidate)):
         shape = [1] * n
@@ -44,19 +66,28 @@ def opt_blocksize(input_size, kernel_size, speed_impt=0.5):
         c_info *= BC
         e_info += np.ceil(np.log2(BS))
         s_info *= BS
+        p_info *= [BS, (BS // 2 + 1) * 2][i == n - 1 and real_input]
+        d_info[..., i] = GP
 
     # Assume cuFFT is as follows:
     # time complexity = n ⌈log2 n⌉
     # memory complexity = 2 ^ ⌈log2 n⌉
-    time_cost = np.prod(kernel_size[:2]) * s_info * e_info
-    time_cost += np.prod(input_size[:2]) * c_info * s_info * e_info
-    time_cost += input_size[0] * np.prod(kernel_size[:2]) * c_info * s_info
-    time_cost += input_size[0] * kernel_size[0] * c_info * s_info * e_info
+    b_const = [1, 2][backward]
+    pad_cond = ((d_info > 0).any(-1) | np.bool_(not padpenalty)).astype(d_info.dtype)
 
-    memo_cost = np.prod(kernel_size[:2]) * 2**e_info
-    memo_cost += np.prod(input_size[:2]) * c_info * 2**e_info
-    memo_cost += input_size[0] * kernel_size[0] * c_info * s_info
-    memo_cost += input_size[0] * kernel_size[0] * c_info * 2**e_info
+    time_cost = np.prod(kernel_size[:2]) * s_info * np.maximum(1, e_info)
+    time_cost += np.prod(input_size[:2]) * (S + d_info).prod(-1) * pad_cond  # pad
+    time_cost += np.prod(input_size[:2]) * c_info * s_info * np.maximum(1, e_info)
+    time_cost += input_size[0] * np.prod(kernel_size[:2]) * c_info * p_info
+    time_cost += (
+        input_size[0] * kernel_size[0] * c_info * s_info * np.maximum(1, e_info)
+    )
+
+    memo_cost = np.prod(kernel_size[:2]) * (p_info * b_const + 2**e_info)
+    memo_cost += np.prod(input_size[:2]) * (S + d_info).prod(-1) * pad_cond  # pad
+    memo_cost += np.prod(input_size[:2]) * c_info * (p_info * b_const + 2**e_info)
+    memo_cost += input_size[0] * kernel_size[0] * c_info * p_info
+    memo_cost += input_size[0] * kernel_size[0] * c_info * (s_info + 2**e_info)
 
     tradoff = time_cost ** (speed_impt) * memo_cost ** (1 - speed_impt)
     index = (tradoff == np.min(tradoff)).nonzero()
@@ -153,6 +184,9 @@ def fft_conv(
             + tuple(s + p * 2 for s, p in zip(signal.shape[2:], padding_)),
             kernel.shape,
             tradeoff,
+            real_input=not any(map(torch.is_complex, [signal, kernel])),
+            padpenalty=all(x == 0 for x in padding_),
+            backward=any(M.requires_grad for M in [signal, kernel]),
         )
         if blocksize is None
         else to_ntuple(blocksize, n=n)
@@ -167,11 +201,15 @@ def fft_conv(
     FFTss = BS  # fft signal size
     TRG = S + PD * 2 - K + 1  # target output shape
 
-    signal_pad = F.pad(
-        signal,
-        [x for p, gp in zip(padding_, GP) for x in [p + gp, p]][::-1],
-        padding_mode,
-    )
+    if PD.any() or GP.any():
+        signal_pad = F.pad(
+            signal,
+            [x for p, gp in zip(PD, GP) for x in [p + gp, p]][::-1],
+            padding_mode,
+        )
+    else:
+        signal_pad = signal
+
     block_signal = Dblock(signal_pad, B, BS)
     for _ in range(n):
         kernel = kernel.unsqueeze(2)

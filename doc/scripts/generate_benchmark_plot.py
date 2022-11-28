@@ -22,13 +22,18 @@ def _get_conv_inputs(
     batch_size: int = 2,
     in_channels: int = 8,
     out_channels: int = 8,
+    groups: int = 8,
 ):
     dims = ndim * [input_size]
     signal = torch.randn(batch_size, in_channels, *dims, device="cuda")
 
     kernel_size = to_ntuple(kernel_size, n=signal.ndim - 2)
     weight = torch.randn(
-        out_channels, in_channels, *kernel_size, requires_grad=True, device="cuda"
+        out_channels,
+        in_channels // groups,
+        *kernel_size,
+        requires_grad=True,
+        device="cuda",
     )
     bias = torch.randn(out_channels, requires_grad=True, device="cuda")
 
@@ -41,12 +46,13 @@ def benchmark_conv(
     kernel_size: int,
     method: Callable = None,
     num_iterations: int = 10,
+    **chan_opt,
 ):
     signal, weight, bias = _get_conv_inputs(
-        ndim=ndim, input_size=input_size, kernel_size=kernel_size
+        ndim=ndim, input_size=input_size, kernel_size=kernel_size, **chan_opt
     )
     return benchmark(
-        method,
+        partial(method, groups=chan_opt["groups"]),
         signal,
         weight,
         bias=bias,
@@ -61,6 +67,7 @@ def benchmark_kernel_size(
     method: Callable = None,
     num_iterations: int = 10,
     desc: str = "",
+    **chan_opt,
 ):
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -70,6 +77,7 @@ def benchmark_kernel_size(
         input_size=input_size,
         method=method,
         num_iterations=num_iterations,
+        **chan_opt,
     )
     return zip(*(fn(kernel_size=k) for k in tqdm(kernel_sizes, desc=desc)))
 
@@ -118,18 +126,30 @@ if __name__ == "__main__":
             "input_size": 32768,
             "num_iterations": 16,
             "kernel_sizes": [1] + list(range(256, 4096, 512)),
+            "batch_size": 8,
+            "in_channels": 8,
+            "out_channels": 8,
+            "groups": 1,
         },
         {
             "ndim": 2,
             "input_size": 512,
             "num_iterations": 16,
             "kernel_sizes": [1] + list(np.arange(4, 49, 6)),
+            "batch_size": 8,
+            "in_channels": 8,
+            "out_channels": 8,
+            "groups": 1,
         },
         {
             "ndim": 3,
             "input_size": 64,
             "num_iterations": 16,
-            "kernel_sizes": [1] + list(np.arange(2, 15, 2)),
+            "kernel_sizes": [1] + list(np.arange(2, 9, 2)),
+            "batch_size": 8,
+            "in_channels": 8,
+            "out_channels": 8,
+            "groups": 1,
         },
     ]
 
