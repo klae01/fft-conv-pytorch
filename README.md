@@ -49,8 +49,21 @@ scaling with kernel size is always the same.
 
 Dimensions | Input Size   | Input Channels | Output Channels | Bias | Padding | Stride | Dilation
 -----------|--------------|----------------|-----------------|------|---------|--------|---------
-1          | (4096)       | 4              | 4               | True | 0       | 1      | 1
-2          | (512, 512)   | 4              | 4               | True | 0       | 1      | 1
-3          | (64, 64, 64) | 4              | 4               | True | 0       | 1      | 1
+1          | (32768)      | 8              | 8               | True | 0       | 1      | 1
+2          | (512, 512)   | 8              | 8               | True | 0       | 1      | 1
+3          | (64, 64, 64) | 8              | 8               | True | 0       | 1      | 1
 
 ![Benchmark Plot](doc/benchmark.png)
+
+## Miscellaneous
+
+### Test coverage
+```
+pytest --cov --cov-report term-missing --cov-fail-under 90 tests/  --maxfail=1
+```
+
+### Test Performance
+```
+pip install . 
+python3 doc/scripts/generate_benchmark_plot.py
+```

@@ -1,5 +1,5 @@
 from functools import lru_cache, partial
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Union
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -8,14 +8,10 @@ import torch.nn.functional as f
 from matplotlib.ticker import MaxNLocator
 from tqdm import tqdm
 
+from fft_conv_pytorch import functional, optimized
 from fft_conv_pytorch.benchmark_utils import Benchmark, benchmark
-from fft_conv_pytorch.functional import fft_conv, fft_conv_transpose, to_ntuple
 
-
-def cuda_sync(func, *args, **kwargs):
-    X = func(*args, **kwargs)
-    torch.cuda.synchronize()
-    return X
+to_ntuple = functional.to_ntuple
 
 
 @lru_cache(maxsize=1)
@@ -26,31 +22,41 @@ def _get_conv_inputs(
     batch_size: int = 2,
     in_channels: int = 8,
     out_channels: int = 8,
+    groups: int = 8,
 ):
+    factory_kwargs = {'device': "cuda", "dtype": torch.float32}
     dims = ndim * [input_size]
-    signal = torch.randn(batch_size, in_channels, *dims)
+    signal = torch.randn(batch_size, in_channels, *dims, **factory_kwargs)
 
     kernel_size = to_ntuple(kernel_size, n=signal.ndim - 2)
-    weight = torch.randn(out_channels, in_channels, *kernel_size, requires_grad=True)
-    bias = torch.randn(out_channels, requires_grad=True)
+    weight = torch.randn(
+        out_channels,
+        in_channels // groups,
+        *kernel_size,
+        requires_grad=True,
+        **factory_kwargs,
+    )
+    bias = torch.randn(out_channels, requires_grad=True, **factory_kwargs)
 
-    return signal.cuda(), weight.cuda(), bias.cuda()
+    return signal, weight, bias
 
 
 def benchmark_conv(
     ndim: int,
     input_size: int,
     kernel_size: int,
-    fft: bool = True,
     method: Callable = None,
     num_iterations: int = 10,
+    **chan_opt,
 ):
-    conv_fn = method if fft else getattr(f, f"{method.__name__[4:]}{ndim}d")
+    torch.backends.cuda.cufft_plan_cache.clear()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
     signal, weight, bias = _get_conv_inputs(
-        ndim=ndim, input_size=input_size, kernel_size=kernel_size
+        ndim=ndim, input_size=input_size, kernel_size=kernel_size, **chan_opt
     )
     return benchmark(
-        partial(cuda_sync, conv_fn),
+        partial(method, groups=chan_opt["groups"]),
         signal,
         weight,
         bias=bias,
@@ -62,46 +68,57 @@ def benchmark_kernel_size(
     kernel_sizes: Sequence[int],
     ndim: int,
     input_size: int,
-    fft: bool = True,
     method: Callable = None,
     num_iterations: int = 10,
     desc: str = "",
-) -> List[Benchmark]:
+    **chan_opt,
+):
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     fn = partial(
         benchmark_conv,
         ndim=ndim,
         input_size=input_size,
-        fft=fft,
         method=method,
         num_iterations=num_iterations,
+        **chan_opt,
     )
-    return [fn(kernel_size=k) for k in tqdm(kernel_sizes, desc=desc)]
+    return zip(*(fn(kernel_size=k) for k in tqdm(kernel_sizes, desc=desc)))
 
 
 def _plot_benchmarks(
     benchmarks: List[Benchmark],
     config: Dict,
     ax: plt.Axes,
-    color: str,
     linestyle: str,
     label: Optional[str] = None,
+    upper_info: bool = True,
+    lower_info: bool = True,
 ):
     xs = config["kernel_sizes"]
-    ys = np.array([b.mean * 1000 for b in benchmarks])
-    std = np.array([b.std * 1000 for b in benchmarks])
-    ax.plot(xs, ys, color, linestyle=linestyle, label=label)
+    ys = np.array([b.mean for b in benchmarks])
+    std = np.array([b.std for b in benchmarks])
+    line, *_ = ax.plot(xs, ys, linestyle, label=label)
     ax.fill_between(
-        xs, ys - std, ys + std, facecolor=color, alpha=0.25, label="_nolegend_"
+        xs, ys - std, ys + std, facecolor=linestyle[-1], alpha=0.25, label="_nolegend_"
     )
+    ax.set_xticks(sorted(set(xs)))
+    ax.set_yscale("log")
 
     ndim = config["ndim"]
-    ax.set_title(f"{ndim}D")
-    kernel_size_str = "(" + " x ".join(["n"] * ndim) + ")"
-    ax.set_xlabel(f"Kernel Size {kernel_size_str}")
-    ax.set_yscale("log")
-    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    if upper_info:
+        ax.set_title(f"{ndim}D")
+    if lower_info:
+        ax.set_xlabel(f"Kernel Size ({' x '.join(['n'] * ndim)})")
+    return line
+
+
+def naive_conv(input, weight, *args, **kwargs):
+    return getattr(f, f"conv{weight.ndim-2}d")(input, weight, *args, **kwargs)
+
+
+def naive_conv_transpose(input, weight, *args, **kwargs):
+    return getattr(f, f"conv_transpose{weight.ndim-2}d")(input, weight, *args, **kwargs)
 
 
 if __name__ == "__main__":
@@ -110,54 +127,75 @@ if __name__ == "__main__":
     configs = [
         {
             "ndim": 1,
-            "input_size": 4096,
-            "num_iterations": 256,
-            "kernel_sizes": np.arange(64, 513, 64),
+            "input_size": 32768,
+            "num_iterations": 16,
+            "kernel_sizes": [1] + list(range(256, 4096, 512)),
+            "batch_size": 2,
+            "in_channels": 8,
+            "out_channels": 8,
+            "groups": 1,
         },
         {
             "ndim": 2,
             "input_size": 512,
             "num_iterations": 16,
-            "kernel_sizes": np.arange(4, 49, 6),
+            "kernel_sizes": [1] + list(np.arange(4, 49, 6)),
+            "batch_size": 2,
+            "in_channels": 8,
+            "out_channels": 8,
+            "groups": 1,
         },
         {
             "ndim": 3,
             "input_size": 64,
             "num_iterations": 16,
-            "kernel_sizes": np.arange(2, 15, 2),
+            "kernel_sizes": [1] + list(np.arange(2, 9, 2)),
+            "batch_size": 2,
+            "in_channels": 8,
+            "out_channels": 8,
+            "groups": 1,
         },
     ]
 
     save_dir = os.path.join(os.path.dirname(__file__), os.path.pardir)
-    fig, ax = plt.subplots(1, 3, figsize=(4 * len(configs), 4), squeeze=False)
+    fig, ax = plt.subplots(2, 3, figsize=(5 * 3, 4 * 2), squeeze=False)
+    handles = dict()
 
-    for method in [fft_conv_transpose, fft_conv]:
+    for label, (method, linestyle) in dict(
+        naive_fft_conv_transpose=[functional.fft_conv_transpose, "s--b"],
+        naive_fft_conv=[functional.fft_conv, "o-b"],
+        optimized_fft_conv_01=[partial(optimized.fft_conv, tradeoff=0.01), "o-r"],
+        optimized_fft_conv_50=[partial(optimized.fft_conv, tradeoff=0.5), "o-.r"],
+        optimized_fft_conv_99=[partial(optimized.fft_conv, tradeoff=0.99), "o:r"],
+        naive_conv=[naive_conv, "o-g"],
+        naive_conv_transpose=[naive_conv_transpose, "s--g"],
+    ).items():
         for i, config in enumerate(configs):
-            work_type = method.__name__[4:]
-            linestyle = [None, "--"]["transpose" in work_type]
-            fft = benchmark_kernel_size(
-                fft=True, **config, method=method, desc=f"FFT {config['ndim']}D"
-            )
-            _plot_benchmarks(
-                fft,
-                config=config,
-                ax=ax[0, config["ndim"] - 1],
-                color="r",
-                linestyle=linestyle,
-                label=f"fft_{work_type}",
-            )
-
-            direct = benchmark_kernel_size(
-                fft=False, **config, method=method, desc=f"Direct {config['ndim']}D"
-            )
-            _plot_benchmarks(
-                direct,
-                config=config,
-                ax=ax[0, config["ndim"] - 1],
-                color="b",
-                linestyle=linestyle,
-                label=f"native_{work_type}",
-            )
-    ax[0, 0].set_ylabel("Execution Time (ms)")
-    ax[0, 2].legend()
+            try:
+                time, memory = benchmark_kernel_size(
+                    **config, method=method, desc=f"{label} {config['ndim']}D"
+                )
+                handles[label] = _plot_benchmarks(
+                    time,
+                    config=config,
+                    ax=ax[0, config["ndim"] - 1],
+                    linestyle=linestyle,
+                    label=label,
+                    lower_info=False,
+                )
+                handles[label] = _plot_benchmarks(
+                    memory,
+                    config=config,
+                    ax=ax[1, config["ndim"] - 1],
+                    linestyle=linestyle,
+                    label=label,
+                    upper_info=False,
+                )
+            except Exception as e:
+                print(e)
+    ax[0, 0].set_ylabel("Execution Time (s)")
+    ax[1, 0].set_ylabel("Execution Memory (GB)")
+    fig.tight_layout()
+    fig.subplots_adjust(right=0.82)
+    fig.legend(handles.values(), handles.keys(), loc="center right")
     plt.savefig(os.path.join(save_dir, "benchmark.png"))

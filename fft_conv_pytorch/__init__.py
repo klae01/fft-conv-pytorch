@@ -1,4 +1,4 @@
-from . import functional, nn
+from . import functional, nn, optimized
 from .nn import (
     FFTConv1d,
     FFTConv2d,
