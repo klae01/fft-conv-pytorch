@@ -24,7 +24,7 @@ def _get_conv_inputs(
     out_channels: int = 8,
     groups: int = 8,
 ):
-    factory_kwargs = {'device': "cuda", "dtype": torch.float32}
+    factory_kwargs = {"device": "cuda", "dtype": torch.float32}
     dims = ndim * [input_size]
     signal = torch.randn(batch_size, in_channels, *dims, **factory_kwargs)
 

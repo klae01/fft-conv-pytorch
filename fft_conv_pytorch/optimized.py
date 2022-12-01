@@ -167,14 +167,50 @@ def opt_control(
     return np.asarray(list(map(lambda x, y: x[y], size_candidate, index)))
 
 
-def Dblock(tensor: Tensor, K, TRG, ST, SSC, JMP, SBC, BSZ):
-    # B C H W -> B C HSSC HSBC HBSZ WSSC WSBC WBSZ
-    def chunk_iter(N, max):
-        for i in range(N // max):
-            yield i, max
-        if N % max:
-            yield N // max, N % max
+# @numba.njit()
+# def Dblock_indexing(section_element_count, valid_blocksize, stride, result):
+#     rindex = 0
+#     pindex = 0
+#     for i, SEC in enumerate(section_element_count):
+#         k_start = (stride - rindex % stride) % stride
+#         ops = min(result.shape[1] - pindex, (SEC - k_start) // stride)
+#         end = pindex + ops
+#         result[0, pindex:end] = i
+#         np.divmod(
+#             np.arange(k_start, ops * stride + k_start, stride),
+#             valid_blocksize,
+#             result[1, pindex:end],
+#             result[2, pindex:end],
+#         )
+#         pindex = end
+#         rindex += SEC
 
+
+@numba.njit()
+def Dblock_indexing(section_case, valid_blocksize, stride, result):
+    rindex = 0
+    pindex = 0
+    for i, SC in enumerate(section_case):
+        for j in range(SC // valid_blocksize + 1):
+            sub_block_ops = min(valid_blocksize, SC - j * valid_blocksize)
+            k_start = (stride - rindex % stride) % stride
+            sub_ops = max(0, (sub_block_ops - k_start + stride - 1) // stride)
+            sub_ops = min(sub_ops, result.shape[1] - pindex)
+            end = pindex + sub_ops
+            result[0, pindex:end] = i
+            result[1, pindex:end] = j
+            result[2, pindex:end] = np.arange(
+                k_start, sub_ops * stride + k_start, stride
+            )
+            pindex += sub_ops
+            rindex += sub_block_ops
+            if result.shape[1] == pindex:
+                return
+
+
+@torch.no_grad()
+def Dblock(tensor: Tensor, K, TRG, ST, SSC, JMP, SBC, BSZ):
+    # B C H W -> B C HSSC HSBC WSSC WSBC HBSZ WBSZ
     def reorder(X):
         nonlocal n
         core = [4 + i * 3 for i in range(n)]
@@ -187,45 +223,28 @@ def Dblock(tensor: Tensor, K, TRG, ST, SSC, JMP, SBC, BSZ):
     stride, T = T[:2], T[2:]
     merge_index = [slice(None)] * 2
     for i, t in enumerate(T):
+        valid_blocksize = BSZ[i] - K[i] + 1
         size.append(SSC[i])
         size.append(SBC[i])
         size.append(BSZ[i])
         stride.append(t * JMP[i])
-        stride.append(t * (BSZ[i] - K[i] + 1))
+        stride.append(t * valid_blocksize)
         stride.append(t)
-
-        max_reuse = [SBC[i] * (BSZ[i] - K[i] + 1), BSZ[i] - K[i] + 1, 1]
-        section_case = [JMP[i]] * (SSC[i] - 1) + [
-            S[i] - (K[i] - 1) - JMP[i] * (SSC[i] - 1)
-        ]
-        indexing = [[] for _ in range(3)]
-        for i1, N1 in enumerate(section_case):
-            indexing[0] += [i1] * N1
-            for i2, N2 in chunk_iter(N1, max_reuse[1]):
-                indexing[1] += [i2] * N2
-                # for i3, N3 in chunk_iter(N2, max_reuse[2]):
-                #     indexing[2] += [i3]* N3
-                indexing[2] += list(range(N2))
+        section_element_count = [JMP[i]] * (SSC[i] - 1) + [valid_blocksize * SBC[i]]
+        npresult = np.empty([3, (TRG[i] + ST[i] - 1) // ST[i]], dtype=np.int64)
+        ptresult = tensor.new_empty(npresult.shape, dtype=torch.long)
+        Dblock_indexing(
+            np.array(section_element_count), valid_blocksize, ST[i], npresult
+        )
+        ptresult.copy_(torch.from_numpy(npresult), non_blocking=True)
         index_shape = [[1, -1][i == idx] for idx in range(n)]
-        merge_index += [
-            torch.tensor(IDX[: TRG[i] : ST[i]])
-            .to(tensor.device, non_blocking=True)
-            .reshape(index_shape)
-            for IDX in indexing
-        ]
+        merge_index += ptresult.reshape(3, *index_shape)
     size, stride, merge_index = map(reorder, [size, stride, merge_index])
     return tensor.as_strided(size, stride), merge_index
 
 
 def Mblock(tensor: Tensor, merge_index):
     return tensor[merge_index]
-    # ops_index = [slice(None)] * 2
-    # n = (tensor.ndim - 2) // 3
-    # for i, IDX in enumerate(merge_index):
-    #     eff_dim = i // 3
-    #     index_shape = [[1, -1][eff_dim == idx] for idx in range(n)]
-    #     ops_index.append(np.array(IDX).reshape(index_shape))
-    # return tensor[ops_index]
 
 
 def fft_conv(
