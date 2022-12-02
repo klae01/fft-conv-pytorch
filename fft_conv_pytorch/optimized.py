@@ -144,22 +144,40 @@ def opt_control(
     # Assume cuFFT is as follows:
     # time complexity = n ⌈log2 n⌉
     # memory complexity = 2 ^ ⌈log2 n⌉
-    b_const = [1, 2][backward]
     pad_cond = ((d_info > 0).any(-1) | np.bool_(not padpenalty)).astype(d_info.dtype)
 
-    time_cost = np.prod(kernel_size[:2]) * s_info * np.maximum(1, e_info)
-    time_cost += np.prod(input_size[:2]) * (S + d_info).prod(-1) * pad_cond  # pad
+    time_cost = np.prod(input_size[:2]) * (S + d_info).prod(-1) * pad_cond  # pad
+    time_cost += np.prod(kernel_size[:2]) * s_info * np.maximum(1, e_info)
     time_cost += np.prod(input_size[:2]) * c_info * s_info * np.maximum(1, e_info)
     time_cost += input_size[0] * np.prod(kernel_size[:2]) * c_info * p_info
     time_cost += (
         input_size[0] * kernel_size[0] * c_info * s_info * np.maximum(1, e_info)
     )
 
-    memo_cost = np.prod(kernel_size[:2]) * (p_info * b_const + 2**e_info)
-    memo_cost += np.prod(input_size[:2]) * (S + d_info).prod(-1) * pad_cond  # pad
-    memo_cost += np.prod(input_size[:2]) * c_info * (p_info * b_const + 2**e_info)
-    memo_cost += input_size[0] * kernel_size[0] * c_info * p_info
-    memo_cost += input_size[0] * kernel_size[0] * c_info * (s_info + 2**e_info)
+    def update(peak, curr):
+        nonlocal memo_curr, memo_peak
+        np.maximum(memo_peak, memo_curr + peak, out=memo_peak)
+        memo_curr += curr
+
+    memo_curr = np.prod(input_size[:2]) * (S + d_info).prod(-1) * pad_cond  # pad
+    memo_peak = memo_curr.copy()
+    update(
+        np.prod(kernel_size[:2]) * (p_info * 2 + s_info),
+        np.prod(kernel_size[:2]) * p_info * 2,
+    )
+    update(
+        np.prod(input_size[:2]) * c_info * (p_info * 2 + s_info),
+        np.prod(input_size[:2]) * c_info * p_info,
+    )
+    update(
+        input_size[0] * kernel_size[0] * c_info * p_info * 2,
+        input_size[0] * kernel_size[0] * c_info * p_info,
+    )
+    update(
+        input_size[0] * kernel_size[0] * c_info * (p_info * 2 + s_info),
+        input_size[0] * kernel_size[0] * c_info * s_info,
+    )
+    memo_cost = memo_peak
 
     tradoff = time_cost ** (speed_impt) * memo_cost ** (1 - speed_impt)
     index = (tradoff == np.min(tradoff)).nonzero()
