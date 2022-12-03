@@ -349,12 +349,18 @@ def fft_conv(
 
     signal, merge_index = Dblock(signal, K, TRG, ST, SSC, JMP, SBC, BSZ)
     kernel = kernel[[slice(None)] * 2 + [None] * 2 * n + [slice(None)] * n]
-    
-    signal_fr = rfftn(signal, BSZ.tolist(), dim=tuple(range(-n, 0)))
-    kernel_fr = rfftn(kernel, BSZ.tolist(), dim=tuple(range(-n, 0)))
-    output_fr = complex_matmul(signal_fr, kernel_fr.conj(), groups=groups)
-    output = irfftn(output_fr, BSZ.tolist(), dim=tuple(range(-n, 0)))
-    output = Mblock(output, merge_index)
+    output = Mblock(
+        irfftn(
+            complex_matmul(
+                rfftn(signal, BSZ.tolist(), dim=tuple(range(-n, 0))),
+                rfftn(kernel, BSZ.tolist(), dim=tuple(range(-n, 0))).conj(),
+                groups=groups,
+            ),
+            BSZ.tolist(),
+            dim=tuple(range(-n, 0)),
+        ),
+        merge_index,
+    )
 
     # Optionally, add a bias term before returning.
     if bias is not None:
