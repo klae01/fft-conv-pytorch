@@ -32,8 +32,8 @@ def measure():
         yield result
     finally:
         torch.cuda.synchronize()
-        result["time"] = time.time() - begin
-        result["memory"] = torch.cuda.memory_stats()["allocated_bytes.all.peak"] / 2**30
+    result["time"] = time.time() - begin
+    result["memory"] = torch.cuda.memory_stats()["allocated_bytes.all.peak"] / 2**30
 
 
 def benchmark(
