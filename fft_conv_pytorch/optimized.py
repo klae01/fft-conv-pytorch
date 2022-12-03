@@ -124,11 +124,12 @@ def opt_control(
 
     size_candidate = list(map(candidates, S, K))
     ops_size = list(map(len, size_candidate))
-    c_info = np.ones(ops_size, dtype=np.float64)  # block count
-    e_info = np.zeros(ops_size, dtype=np.float64)  # log of block size
-    s_info = np.ones(ops_size, dtype=np.float64)  # block size
-    p_info = np.ones(ops_size, dtype=np.float64)  # plane
-    d_info = np.zeros(ops_size + [n], dtype=np.float64)  # padding
+    c_info = np.ones(ops_size, dtype=np.int64)  # block count
+    e_info = np.zeros(ops_size, dtype=np.int64)  # log of block size
+    s_info = np.ones(ops_size, dtype=np.int64)  # block size
+    p_info = np.ones(ops_size, dtype=np.int64)  # plane
+    d_info = np.zeros(ops_size + [n], dtype=np.int64)  # padding
+    b_info = np.zeros(ops_size + [n], dtype=np.int64)  # block size
 
     for i, SCD in enumerate(size_candidate):
         shape = [1] * n
@@ -136,17 +137,22 @@ def opt_control(
         BC1, _, BC2, BS, GP = map(lambda x: x.reshape(shape), SCD.T)
         BC = BC1 * BC2
         c_info *= BC
-        e_info += np.ceil(np.log2(BS))
+        e_info += np.ceil(np.log2(BS)).astype(e_info.dtype)
         s_info *= BS
         p_info *= [BS, (BS // 2 + 1) * 2][i == n - 1 and real_input]
         d_info[..., i] = GP
+        b_info[..., i] = BS
 
     # Assume cuFFT is as follows:
     # time complexity = n ⌈log2 n⌉
     # memory complexity = 2 ^ ⌈log2 n⌉
-    pad_cond = ((d_info > 0).any(-1) | np.bool_(not padpenalty)).astype(d_info.dtype)
+    sig_pad = ((d_info > 0).any(-1) | np.bool_(not padpenalty)).astype(d_info.dtype)
+    krn_pad = (b_info != K).any(-1).astype(d_info.dtype)
+    sig_cnt = (c_info != 1).astype(d_info.dtype)
 
-    time_cost = np.prod(input_size[:2]) * (S + d_info).prod(-1) * pad_cond  # pad
+    time_cost = np.prod(input_size[:2]) * (S + d_info).prod(-1) * sig_pad  # signal pad
+    time_cost += np.prod(kernel_size[:2]) * b_info.prod(-1) * krn_pad  # kernel pad
+    time_cost += np.prod(input_size[:2]) * c_info * s_info * sig_cnt  # sig contiguous
     time_cost += np.prod(kernel_size[:2]) * s_info * np.maximum(1, e_info)
     time_cost += np.prod(input_size[:2]) * c_info * s_info * np.maximum(1, e_info)
     time_cost += input_size[0] * np.prod(kernel_size[:2]) * c_info * p_info
@@ -154,30 +160,46 @@ def opt_control(
         input_size[0] * kernel_size[0] * c_info * s_info * np.maximum(1, e_info)
     )
 
-    def update(peak, curr):
-        nonlocal memo_curr, memo_peak
+    def update(peak, curr, band=None):
+        nonlocal memo_curr, memo_band, memo_peak
         np.maximum(memo_peak, memo_curr + peak, out=memo_peak)
+        memo_band += [band, peak][band is None]
         memo_curr += curr
 
-    memo_curr = np.prod(input_size[:2]) * (S + d_info).prod(-1) * pad_cond  # pad
+    memo_curr = np.prod(input_size[:2]) * (S + d_info).prod(-1) * sig_pad  # signal pad
+    memo_curr += np.prod(kernel_size[:2]) * s_info * krn_pad  # kernal pad
+    memo_curr += np.prod(input_size[:2]) * c_info * s_info * sig_cnt  # sig contiguous
+    memo_band = memo_curr.copy()
     memo_peak = memo_curr.copy()
     update(
-        np.prod(kernel_size[:2]) * (p_info * 2 + s_info),
-        np.prod(kernel_size[:2]) * p_info * 2,
+        np.prod(kernel_size[:2]) * s_info * 2,
+        np.prod(kernel_size[:2]) * p_info,
+        # np.prod(kernel_size[:2]) * s_info * e_info,
     )
     update(
-        np.prod(input_size[:2]) * c_info * (p_info * 2 + s_info),
+        np.prod(input_size[:2]) * c_info * s_info * 2,
         np.prod(input_size[:2]) * c_info * p_info,
+        # np.prod(input_size[:2]) * c_info * s_info * e_info,
+    )
+    sig_tensor = np.prod(input_size[:2]) * c_info * p_info
+    krn_tensor = np.prod(kernel_size[:2]) * p_info
+    out_tensor = input_size[0] * kernel_size[0] * c_info * p_info
+    grad_save = sig_tensor + krn_tensor if backward else 0
+    update(
+        np.maximum(sig_tensor, krn_tensor) + out_tensor + grad_save,
+        out_tensor + grad_save,
+        input_size[0] * np.prod(kernel_size[:2]) * c_info * p_info
+        + sig_tensor
+        + krn_tensor
+        + out_tensor,
     )
     update(
-        input_size[0] * kernel_size[0] * c_info * p_info * 2,
-        input_size[0] * kernel_size[0] * c_info * p_info,
-    )
-    update(
-        input_size[0] * kernel_size[0] * c_info * (p_info * 2 + s_info),
+        input_size[0] * kernel_size[0] * c_info * s_info * 2,
         input_size[0] * kernel_size[0] * c_info * s_info,
+        # input_size[0] * kernel_size[0] * c_info * s_info * e_info,
     )
-    memo_cost = memo_peak
+    memo_cost = memo_peak.astype(np.float64)
+    time_cost = (time_cost + memo_band * 4).astype(np.float64)
 
     tradoff = time_cost ** (speed_impt) * memo_cost ** (1 - speed_impt)
     index = (tradoff == np.min(tradoff)).nonzero()
@@ -327,7 +349,7 @@ def fft_conv(
 
     signal, merge_index = Dblock(signal, K, TRG, ST, SSC, JMP, SBC, BSZ)
     kernel = kernel[[slice(None)] * 2 + [None] * 2 * n + [slice(None)] * n]
-
+    
     signal_fr = rfftn(signal, BSZ.tolist(), dim=tuple(range(-n, 0)))
     kernel_fr = rfftn(kernel, BSZ.tolist(), dim=tuple(range(-n, 0)))
     output_fr = complex_matmul(signal_fr, kernel_fr.conj(), groups=groups)

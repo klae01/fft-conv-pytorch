@@ -24,7 +24,7 @@ def _get_conv_inputs(
     out_channels: int = 8,
     groups: int = 8,
 ):
-    factory_kwargs = {"device": "cuda", "dtype": torch.float32}
+    factory_kwargs = {"requires_grad": True, "device": "cuda", "dtype": torch.float32}
     dims = ndim * [input_size]
     signal = torch.randn(batch_size, in_channels, *dims, **factory_kwargs)
 
@@ -33,10 +33,9 @@ def _get_conv_inputs(
         out_channels,
         in_channels // groups,
         *kernel_size,
-        requires_grad=True,
         **factory_kwargs,
     )
-    bias = torch.randn(out_channels, requires_grad=True, **factory_kwargs)
+    bias = torch.randn(out_channels, **factory_kwargs)
 
     return signal, weight, bias
 
@@ -83,7 +82,9 @@ def benchmark_kernel_size(
         num_iterations=num_iterations,
         **chan_opt,
     )
-    return zip(*(fn(kernel_size=k) for k in tqdm(kernel_sizes, desc=desc)))
+    return zip(
+        *(fn(kernel_size=k) for k in tqdm(kernel_sizes, desc=f"{desc:<30s}", ncols=0))
+    )
 
 
 def _plot_benchmarks(
