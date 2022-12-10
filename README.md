@@ -59,11 +59,12 @@ Dimensions | Input Size   | Input Channels | Output Channels | Bias | Padding | 
 
 ### Test coverage
 ```
+pip install --no-cache-dir .
 pytest --cov --cov-report term-missing --cov-fail-under 90 tests/  --maxfail=1
 ```
 
 ### Test Performance
 ```
-pip install . 
+pip install --no-cache-dir .
 python3 doc/scripts/generate_benchmark_plot.py
 ```

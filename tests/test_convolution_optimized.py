@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as f
 
 from fft_conv_pytorch.benchmark_utils import _assert_almost_equal, _gcd
-from fft_conv_pytorch.optimized import fft_conv, to_ntuple
+from fft_conv_pytorch.optimized.functional import fft_conv, to_ntuple
 
 
 @pytest.mark.parametrize("tradeoff", [0.01, 0.5, 0.99])

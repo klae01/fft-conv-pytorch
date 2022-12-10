@@ -9,8 +9,22 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.fft import irfftn, rfftn
 
-from .functional import complex_matmul
-from .utils import to_ntuple
+from .extension import FastPlaneDot
+from ..utils import to_ntuple
+
+
+def complex_matmul(a: Tensor, b: Tensor, n: int, groups: int) -> Tensor:
+    return (
+        FastPlaneDot.apply(
+            a.unflatten(1, [groups, a.size(1) // groups])
+            .flatten(-n * 3, -n - 1)
+            .flatten(-n),
+            b.unflatten(0, [groups, b.size(0) // groups]).flatten(-n),
+        )
+        .flatten(1, 2)
+        .unflatten(-2, a.shape[-3 * n : -n])
+        .unflatten(-1, a.shape[-n:])
+    )
 
 
 @numba.njit()
@@ -186,7 +200,7 @@ def opt_control(
     out_tensor = input_size[0] * kernel_size[0] * c_info * p_info
     grad_save = sig_tensor + krn_tensor if backward else 0
     update(
-        np.maximum(sig_tensor, krn_tensor) + out_tensor + grad_save,
+        out_tensor + grad_save,
         out_tensor + grad_save,
         input_size[0] * np.prod(kernel_size[:2]) * c_info * p_info
         + sig_tensor
@@ -348,12 +362,12 @@ def fft_conv(
         signal = F.pad(signal, signal_padding, mode=padding_mode)
 
     signal, merge_index = Dblock(signal, K, TRG, ST, SSC, JMP, SBC, BSZ)
-    kernel = kernel[[slice(None)] * 2 + [None] * 2 * n + [slice(None)] * n]
     output = Mblock(
         irfftn(
             complex_matmul(
                 rfftn(signal, BSZ.tolist(), dim=tuple(range(-n, 0))),
                 rfftn(kernel, BSZ.tolist(), dim=tuple(range(-n, 0))).conj(),
+                n=n,
                 groups=groups,
             ),
             BSZ.tolist(),

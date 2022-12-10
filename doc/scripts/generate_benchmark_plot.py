@@ -8,7 +8,8 @@ import torch.nn.functional as f
 from matplotlib.ticker import MaxNLocator
 from tqdm import tqdm
 
-from fft_conv_pytorch import functional, optimized
+from fft_conv_pytorch import functional
+from fft_conv_pytorch.optimized import functional as optimized
 from fft_conv_pytorch.benchmark_utils import Benchmark, benchmark
 
 to_ntuple = functional.to_ntuple
