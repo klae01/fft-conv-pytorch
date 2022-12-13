@@ -73,9 +73,10 @@ void PlaneDot_backprop_B(
                 AB[G][O][I][L] += AA[i][G][I][j][L] * AC[i][G][O][j][L];
     }
 }
-at::Tensor PlaneDot_wrapper(
+void PlaneDot_wrapper(
     at::Tensor Mat_A,
-    at::Tensor Mat_B
+    at::Tensor Mat_B,
+    at::Tensor Mat_C
 ) {
     uint B=Mat_A.sizes()[0];
     uint G=Mat_A.sizes()[1];
@@ -83,9 +84,6 @@ at::Tensor PlaneDot_wrapper(
     uint S=Mat_A.sizes()[3];
     uint L=Mat_A.sizes()[4];
     uint O=Mat_B.sizes()[1];
-    at::TensorOptions Topt;
-    Topt = Topt.device(Mat_A.device()).dtype(Mat_A.dtype());
-    at::Tensor Mat_C=at::empty({B, G, O, S, L}, Topt);
     AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND(at::ScalarType::Half, Mat_A.type(), "PlaneDot", ([&] {
         PlaneDot<scalar_t> (
             Mat_A.accessor<scalar_t,5>(),
@@ -94,7 +92,6 @@ at::Tensor PlaneDot_wrapper(
             Mat_C.numel()
         );
     }));
-    return Mat_C;
 }
 void PlaneDot_backprop_A_wrapper(
     at::Tensor Mat_A,

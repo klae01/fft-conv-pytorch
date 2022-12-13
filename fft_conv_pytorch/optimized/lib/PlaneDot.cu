@@ -4,164 +4,282 @@
 
 #include <stdio.h>
 #include <algorithm>
+#include <cassert>
 
 typedef unsigned int uint;
 
+#define size_t_cuda_copy(OUT, LIMIT, ...)                                           \
+{                                                                                   \
+    cudaMalloc(&OUT, LIMIT * sizeof(size_t));                                       \
+    size_t *__host_array=(size_t*)malloc(LIMIT * sizeof(size_t));                   \
+    for(size_t __iteration=0; __iteration < LIMIT; __iteration++)                   \
+        __host_array[__iteration] = __VA_ARGS__(__iteration);                       \
+    cudaMemcpy(OUT, __host_array, LIMIT * sizeof(size_t), cudaMemcpyHostToDevice);  \
+}
+#define ProblemInfoShortCut(INFO)   \
+    size_t const &ndim=INFO.ndim;   \
+    size_t *const &DIM=INFO.DIM;    \
+    size_t *const &DIV=INFO.DIV;    \
+    size_t *const &BLK=INFO.BLK;
+
+template <typename scalar_t>
+struct MatrixInfo {
+    scalar_t *Mat;
+    scalar_t *Fetch;
+    scalar_t *prev_offset;
+    size_t *stride;
+    size_t ndim;
+    size_t fetch_numel;
+    size_t effective_dim;
+    size_t last_Jobindex;
+    MatrixInfo(at::Tensor &Matrix, size_t fetch_numel_, size_t effective_dim_) {
+        Mat = Matrix.data_ptr<scalar_t>();
+        ndim = Matrix.ndimension();
+        fetch_numel = fetch_numel_;
+        effective_dim = effective_dim_;
+        assert(Matrix.ndimension() == __builtin_popcountll(effective_dim));
+        size_t_cuda_copy(stride, ndim, Matrix.stride);
+    }
+    __device__ scalar_t* initialize(scalar_t *memory, const size_t &offset)
+    { 
+        prev_offset=nullptr;
+        Fetch = memory + sizeof(scalar_t) * offset;
+        return Fetch;
+    }
+};
+struct ProblemInfo {
+    size_t *DIM;
+    size_t *DIV;
+    size_t *BLK;
+    size_t ndim;
+    size_t NumJobs;     // equal to prod(BLK)
+    size_t TaskSize;    // equal to prod(DIV)
+    size_t JobChunk;    // equal to prod(<Non-shareable-job-continuous-dimension>)
+    // DIM[0:ndim] = {I J K L M N O}
+    // ...............<--->         : reduction axis -> ChunkDims = 3
+    // .....................<->     : broadcasting axis
+    // .........................<-> : sharing axis
+    // .....................<-----> : non reduction axis / axis of output
+
+    ProblemInfo(auto &_DIM, auto &_DIV, size_t ChunkDims) {
+        assert(_DIM.size(0)==_DIV.size(0));
+        assert(ChunkDims<_DIV.size(0));
+        ndim=_DIM.size(0);
+        size_t_cuda_copy(DIM, ndim, [&](size_t i){return _DIM[i];});
+        size_t_cuda_copy(DIV, ndim, [&](size_t i){return _DIV[i];});
+        size_t_cuda_copy(BLK, ndim, [&](size_t i){return 1 + (_DIM[i] - 1) / _DIV[i];});
+        NumJobs=1; TaskSize=1; JobChunk=1;
+        for(size_t i=0; i<ndim; i++)        NumJobs *=BLK[i];
+        for(size_t i=0; i<ndim; i++)        TaskSize*=DIV[i];
+        for(size_t i=0; i<ChunkDims; i++)   JobChunk*=BLK[i];
+    }
+    __device__ size_t getJobIndex(size_t worker_id, size_t worker_pool)
+    { return NumJobs / JobChunk * worker_id / worker_pool * JobChunk; }
+    size_t DivisibleJobCount()
+    { return NumJobs / JobChunk; }
+};
+
+template <typename scalar_t>
+__device__ scalar_t* getBlockOffset(
+    MatrixInfo<scalar_t> &INFO,
+    const ProblemInfo &INFO_P,
+    size_t index
+) {
+    ProblemInfoShortCut(INFO_P);
+    size_t position=0, effective_dim=INFO.effective_dim;
+    for(size_t i=0, lv=0; i<ndim; index /= BLK[i++], effective_dim >>= 1)
+        if(effective_dim & 1)
+        {
+            position += index % BLK[i] * INFO.stride[lv] * DIV[i];
+            lv++;
+        }
+    return INFO.Mat + position;
+}
+
+template <typename scalar_t>
+__device__ scalar_t* getDivisionRelativeIndex(
+    MatrixInfo<scalar_t> &INFO,
+    const ProblemInfo &INFO_P,
+    size_t JOBindex,
+    size_t DIVindex,
+    scalar_t *&offset
+) {
+    // return nullptr if out-of-matrix condition
+    ProblemInfoShortCut(INFO_P);
+    size_t position=0, effective_dim=INFO.effective_dim;
+    for(size_t i=0, lv=0; i<ndim; JOBindex /= BLK[i], DIVindex /= DIV[i], i++, effective_dim >>= 1)
+        if(effective_dim & 1)
+        {
+            if(DIM[i] > JOBindex % BLK[i] * DIV[i] + DIVindex % DIV[i])
+            {
+                position += DIVindex % DIV[i] * INFO.stride[lv];
+                lv++;
+            }
+            else
+                return nullptr;
+        }
+    return offset + position;
+}
+
+template <typename scalar_t>
+__device__ size_t getFetchRelativeIndex(
+    MatrixInfo<scalar_t> &INFO,
+    const ProblemInfo &INFO_P,
+    size_t index
+) {
+    ProblemInfoShortCut(INFO_P);
+    size_t position=0, stride=1, effective_dim=INFO.effective_dim;
+    for(size_t i=0, lv=0; i<ndim; index /= DIV[i++], effective_dim >>= 1)
+        if(effective_dim & 1)
+        {
+            position += index % DIV[i] * stride;
+            stride *= DIV[i];
+            lv++;
+        }
+    return position;
+}
+
+template <typename scalar_t>
+__device__ void writebackMatrix(
+    MatrixInfo<scalar_t> &INFO,
+    const ProblemInfo &INFO_P,
+    const size_t &Worker
+) {
+    scalar_t *pointer;
+    if(INFO.prev_offset != nullptr)
+        for(size_t DIVindex=0; DIVindex<INFO.fetch_numel; DIVindex+=Worker)
+        {
+            pointer = getDivisionRelativeIndex<scalar_t>(
+                INFO, INFO_P, INFO.last_Jobindex, DIVindex, INFO.prev_offset
+            );
+            if(pointer != nullptr)
+                *pointer = INFO.Fetch[DIVindex];
+        }
+}
+
+template <bool loadfetch, bool writeback, typename scalar_t>
+__device__ void fetchMatrix(
+    MatrixInfo<scalar_t> &INFO,
+    const ProblemInfo &INFO_P,
+    const size_t &JOBindex,
+    const size_t &Worker
+) {
+    scalar_t *offset = getBlockOffset<scalar_t>(INFO, INFO_P, JOBindex);
+    scalar_t *pointer;
+    if(INFO.prev_offset != offset)
+    {
+        if(writeback)
+        {
+            writebackMatrix<scalar_t>(INFO, INFO_P, Worker);
+            INFO.last_Jobindex = JOBindex;
+        }
+        if(loadfetch)
+            for(size_t DIVindex=0; DIVindex<INFO.fetch_numel; DIVindex+=Worker)
+            {
+                pointer = getDivisionRelativeIndex<scalar_t>(
+                    INFO, INFO_P, JOBindex, DIVindex, offset
+                );
+                if(pointer != nullptr)
+                    INFO.Fetch[DIVindex] = *pointer;
+            }
+        else
+            for(size_t DIVindex=0; DIVindex<INFO.fetch_numel; DIVindex+=Worker)
+                INFO.Fetch[DIVindex] = 0;
+    }
+    INFO.prev_offset = offset;
+}
+
+template <typename scalar_t>
+__device__ void accFetch(
+    MatrixInfo<scalar_t> &INFO_A,
+    MatrixInfo<scalar_t> &INFO_B,
+    MatrixInfo<scalar_t> &INFO_C,
+    const ProblemInfo &INFO_P,
+    const size_t &Worker
+) {
+    for(size_t i=0; i<INFO_P.TaskSize; i+=Worker)
+        INFO_C.Fetch[getFetchRelativeIndex<scalar_t>(INFO_C, INFO_P, i)] += (
+            INFO_A.Fetch[getFetchRelativeIndex<scalar_t>(INFO_A, INFO_P, i)]
+            * 
+            INFO_B.Fetch[getFetchRelativeIndex<scalar_t>(INFO_B, INFO_P, i)]
+        );
+}
+
 template <typename scalar_t>
 __global__ void PlaneDot(
-    const at::PackedTensorAccessor32<scalar_t, 5, at::RestrictPtrTraits> AA,
-    const at::PackedTensorAccessor32<scalar_t, 4, at::RestrictPtrTraits> AB,
-    at::PackedTensorAccessor32<scalar_t, 5, at::RestrictPtrTraits> AC,
-    const uint end_index, const uint jump)
-{
-    // index: bgosl
-    // bgisl,goil->bgosl
-    // sum over i
-    uint index = blockDim.x * blockIdx.x + threadIdx.x;
-    uint i;
-    uint sub_index[5];
-    uint &tmp=sub_index[0], &B=sub_index[0], &G=sub_index[1], &O=sub_index[2], &S=sub_index[3], &L=sub_index[4];
-    uint I=AA.size(2);
-    for(;index<end_index; index+=jump)
+    MatrixInfo<scalar_t> INFO_A,
+    MatrixInfo<scalar_t> INFO_B,
+    MatrixInfo<scalar_t> INFO_C,
+    ProblemInfo INFO_P
+) {
+    extern __shared__ __align__(sizeof(scalar_t)) unsigned char sdata_uchar[];
+    scalar_t *fetch = reinterpret_cast<scalar_t *>(sdata_uchar);
+    size_t JOBindex=INFO_P.getJobIndex(blockIdx.x, gridDim.x);
+    size_t JOBlast=INFO_P.getJobIndex(blockIdx.x+1, gridDim.x);
+    scalar_t *fetch_pos = fetch;
+    fetch_pos = INFO_A.initialize(fetch_pos, 0);
+    fetch_pos = INFO_B.initialize(fetch_pos, INFO_A.fetch_numel);
+    fetch_pos = INFO_C.initialize(fetch_pos, INFO_B.fetch_numel);
+
+    for(; JOBindex < JOBlast; JOBindex++)
     {
-        for(tmp=index, i=5; --i; sub_index[i]=tmp%AC.size(i), tmp/=AC.size(i));
-        AC[B][G][O][S][L]=0;
-        for(i=0;i<I;i++)
-            AC[B][G][O][S][L] += AA[B][G][i][S][L] * AB[G][O][i][L];
+        fetchMatrix<true, false, scalar_t>(INFO_A, INFO_P, JOBindex, blockDim.x);
+        fetchMatrix<true, false, scalar_t>(INFO_B, INFO_P, JOBindex, blockDim.x);
+        fetchMatrix<false, true, scalar_t>(INFO_C, INFO_P, JOBindex, blockDim.x);
+        __syncthreads();
+        accFetch<scalar_t>(INFO_A, INFO_B, INFO_C, INFO_P, blockDim.x);
+        __syncthreads();
     }
+    writebackMatrix<scalar_t>(INFO_C, INFO_P, blockDim.x);
 }
-template <typename scalar_t>
-__global__ void PlaneDot_backprop_A(
-    at::PackedTensorAccessor32<scalar_t, 5, at::RestrictPtrTraits> AA,
-    const at::PackedTensorAccessor32<scalar_t, 4, at::RestrictPtrTraits> AB,
-    const at::PackedTensorAccessor32<scalar_t, 5, at::RestrictPtrTraits> AC,
-    const uint end_index, const uint jump)
-{
-    // index: bgisl
-    // bgisl,goil->bgosl
-    // sum over o
-    uint index = blockDim.x * blockIdx.x + threadIdx.x;
-    uint i;
-    uint sub_index[5];
-    uint &tmp=sub_index[0], &B=sub_index[0], &G=sub_index[1], &I=sub_index[2], &S=sub_index[3], &L=sub_index[4];
-    uint O=AC.size(2);
-    for(;index<end_index; index+=jump)
-    {
-        for(tmp=index, i=5; --i; sub_index[i]=tmp%AA.size(i), tmp/=AA.size(i));
-        AA[B][G][I][S][L]=0;
-        for(i=0;i<O;i++)
-            AA[B][G][I][S][L] += AC[B][G][i][S][L] * AB[G][i][I][L];
-    }
-}
-template <typename scalar_t>
-__global__ void PlaneDot_backprop_B(
-    const at::PackedTensorAccessor32<scalar_t, 5, at::RestrictPtrTraits> AA,
-    at::PackedTensorAccessor32<scalar_t, 4, at::RestrictPtrTraits> AB,
-    const at::PackedTensorAccessor32<scalar_t, 5, at::RestrictPtrTraits> AC,
-    const uint end_index, const uint jump)
-{
-    // index: goil
-    // bgisl,goil->bgosl
-    // sum over o
-    uint index = blockDim.x * blockIdx.x + threadIdx.x;
-    uint i, j;
-    uint sub_index[4];
-    uint &tmp=sub_index[0], &G=sub_index[0], &O=sub_index[1], &I=sub_index[2], &L=sub_index[3];
-    uint B=AC.size(0), S=AC.size(3);
-    for(;index<end_index; index+=jump)
-    {
-        for(tmp=index, i=4; --i; sub_index[i]=tmp%AB.size(i), tmp/=AB.size(i));
-        AB[G][O][I][L]=0;
-        for(i=0;i<B;i++)
-            for(j=0;j<S;j++)
-                AB[G][O][I][L] += AA[i][G][I][j][L] * AC[i][G][O][j][L];
-    }
-}
-void determin_task_divide(uint works, uint device, uint&nBlock, uint&nThread) {
+
+void determin_task_divide(size_t works, size_t device, size_t&nBlock, size_t&nThread) {
     cudaDeviceProp *prop=at::cuda::getDeviceProperties(device);
-    works = (works + 31) / 32;
-    nBlock = prop->multiProcessorCount * prop->maxBlocksPerMultiProcessor;
-    nThread = prop->maxThreadsPerBlock / 32;
-    nBlock = std::min(nBlock, (works + nThread - 1) / nThread);
-    nThread = std::min(nThread, (works + nBlock - 1) / nBlock);
-    nThread *= 32;
+    nBlock = min((size_t)prop->multiProcessorCount, works);
+    nThread = prop->maxThreadsPerBlock;
     // printf("reduce: nblock: %d \t nThread: %d\t per thread: %.2f\n", nBlock, nThread, (float)works/nBlock/nThread);
 }
-at::Tensor PlaneDot_wrapper(
+
+void PlaneDot_wrapper(
     at::Tensor Mat_A,
-    at::Tensor Mat_B
+    at::Tensor Mat_B,
+    at::Tensor Mat_C,
+    at::Tensor _DIM,             // [ndim]
+    at::Tensor _DIV,             // [ndim]
+    at::Tensor _ChunkDims,       // []
+    at::Tensor _fetch_numel,     // [3]
+    at::Tensor _effective_dim    // [3]
 ) {
-    uint B=Mat_A.sizes()[0];
-    uint G=Mat_A.sizes()[1];
-    uint I=Mat_A.sizes()[2];
-    uint S=Mat_A.sizes()[3];
-    uint L=Mat_A.sizes()[4];
-    uint O=Mat_B.sizes()[1];
-    at::TensorOptions Topt;
-    Topt = Topt.device(Mat_A.device()).dtype(Mat_A.dtype());
-    at::Tensor Mat_C=at::empty({B, G, O, S, L}, Topt);
-    uint nBlock, nThread;
-    determin_task_divide(Mat_C.numel(), (uint)Mat_A.device().index(), nBlock, nThread);
+    auto DIM = _DIM.accessor<int64_t, 1>();
+    auto DIV = _DIV.accessor<int64_t, 1>();
+    auto fetch_numel = _fetch_numel.accessor<int64_t, 1>();
+    auto effective_dim = _effective_dim.accessor<int64_t, 1>();
+    size_t nBlock, nThread;
+    ProblemInfo INFO_P(DIM, DIV, _ChunkDims.item<int64_t>());
+    determin_task_divide(INFO_P.DivisibleJobCount(), (size_t)Mat_A.device().index(), nBlock, nThread);
     AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND(at::ScalarType::Half, Mat_A.type(), "PlaneDot", ([&] {
-        PlaneDot<scalar_t> <<<nBlock,nThread,0,at::cuda::getCurrentCUDAStream()>>>(
-            Mat_A.packed_accessor32<scalar_t,5,at::RestrictPtrTraits>(),
-            Mat_B.packed_accessor32<scalar_t,4,at::RestrictPtrTraits>(),
-            Mat_C.packed_accessor32<scalar_t,5,at::RestrictPtrTraits>(),
-            Mat_C.numel(),
-            nBlock*nThread
-        );
-    }));
-    return Mat_C;
-}
-void PlaneDot_backprop_A_wrapper(
-    at::Tensor Mat_A,
-    at::Tensor Mat_B,
-    at::Tensor Mat_C
-) {
-    uint B=Mat_A.sizes()[0];
-    uint G=Mat_A.sizes()[1];
-    uint I=Mat_A.sizes()[2];
-    uint S=Mat_A.sizes()[3];
-    uint L=Mat_A.sizes()[4];
-    uint O=Mat_B.sizes()[1];
-    uint nBlock, nThread;
-    determin_task_divide(Mat_A.numel(), (uint)Mat_A.device().index(), nBlock, nThread);
-    AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND(at::ScalarType::Half, Mat_A.type(), "PlaneDot_BP_A", ([&] {
-        PlaneDot_backprop_A<scalar_t> <<<nBlock,nThread,0,at::cuda::getCurrentCUDAStream()>>>(
-            Mat_A.packed_accessor32<scalar_t,5,at::RestrictPtrTraits>(),
-            Mat_B.packed_accessor32<scalar_t,4,at::RestrictPtrTraits>(),
-            Mat_C.packed_accessor32<scalar_t,5,at::RestrictPtrTraits>(),
-            Mat_A.numel(),
-            nBlock*nThread
-        );
-    }));
-}
-void PlaneDot_backprop_B_wrapper(
-    at::Tensor Mat_A,
-    at::Tensor Mat_B,
-    at::Tensor Mat_C
-) {
-    uint B=Mat_A.sizes()[0];
-    uint G=Mat_A.sizes()[1];
-    uint I=Mat_A.sizes()[2];
-    uint S=Mat_A.sizes()[3];
-    uint L=Mat_A.sizes()[4];
-    uint O=Mat_B.sizes()[1];
-    uint nBlock, nThread;
-    determin_task_divide(Mat_B.numel(), (uint)Mat_A.device().index(), nBlock, nThread);
-    AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND(at::ScalarType::Half, Mat_A.type(), "PlaneDot_BP_B", ([&] {
-        PlaneDot_backprop_B<scalar_t> <<<nBlock,nThread,0,at::cuda::getCurrentCUDAStream()>>>(
-            Mat_A.packed_accessor32<scalar_t,5,at::RestrictPtrTraits>(),
-            Mat_B.packed_accessor32<scalar_t,4,at::RestrictPtrTraits>(),
-            Mat_C.packed_accessor32<scalar_t,5,at::RestrictPtrTraits>(),
-            Mat_B.numel(),
-            nBlock*nThread
+        MatrixInfo<scalar_t> INFO_A(Mat_A, fetch_numel[0], effective_dim[0]);
+        MatrixInfo<scalar_t> INFO_B(Mat_B, fetch_numel[1], effective_dim[1]);
+        MatrixInfo<scalar_t> INFO_C(Mat_C, fetch_numel[2], effective_dim[2]);
+        PlaneDot<scalar_t> <<<nBlock,nThread,_fetch_numel.sum().item<int64_t>()*sizeof(scalar_t),at::cuda::getCurrentCUDAStream()>>>(
+            INFO_A, INFO_B, INFO_C, INFO_P
         );
     }));
 }
 
+int Get_MaxBlock(at::Tensor Mat_A) {
+    return at::cuda::getDeviceProperties(Mat_A.device().index())->multiProcessorCount;
+}
+int Get_ShMem(at::Tensor Mat_A) {
+    return at::cuda::getDeviceProperties(Mat_A.device().index())->sharedMemPerMultiprocessor;
+}
+int Get_WarpSize(at::Tensor Mat_A) {
+    return at::cuda::getDeviceProperties(Mat_A.device().index())->warpSize;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("Get_MaxBlock", &Get_MaxBlock, "CUDA DeviceProp");
+    m.def("Get_ShMem", &Get_ShMem, "CUDA DeviceProp");
+    m.def("Get_WarpSize", &Get_WarpSize, "CUDA DeviceProp");
     m.def("PlaneDot_forward", &PlaneDot_wrapper, "PlaneDot CUDA");
-    m.def("PlaneDot_backprop_A", &PlaneDot_backprop_A_wrapper, "PlaneDot backpropagation A CUDA");
-    m.def("PlaneDot_backprop_B", &PlaneDot_backprop_B_wrapper, "PlaneDot backpropagation B CUDA");
 }
