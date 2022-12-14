@@ -174,6 +174,7 @@ __device__ void fetchMatrix(
             INFO.last_Jobindex = JOBindex;
         }
         if(loadfetch)
+            // TODO: P0, pointer is not global memory frendly
             for(size_t DIVindex=0; DIVindex<INFO.fetch_numel; DIVindex+=Worker)
             {
                 pointer = getDivisionRelativeIndex<scalar_t>(
@@ -197,6 +198,7 @@ __device__ void accFetch(
     const ProblemInfo &INFO_P,
     const size_t &Worker
 ) {
+    // TODO: P0, reduction axis do not share over thread
     for(size_t i=0; i<INFO_P.TaskSize; i+=Worker)
         INFO_C.Fetch[getFetchRelativeIndex<scalar_t>(INFO_C, INFO_P, i)] += (
             INFO_A.Fetch[getFetchRelativeIndex<scalar_t>(INFO_A, INFO_P, i)]
