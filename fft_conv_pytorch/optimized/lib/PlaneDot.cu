@@ -6,15 +6,15 @@
 #include <algorithm>
 #include <cassert>
 
-typedef unsigned int uint;
 
-#define size_t_cuda_copy(OUT, LIMIT, ...)                                           \
+#define CUDA_UPLOAD(TYPE, OUT, LIMIT, ...)                                            \
 {                                                                                   \
-    cudaMalloc(&OUT, LIMIT * sizeof(size_t));                                       \
-    size_t *__host_array=(size_t*)malloc(LIMIT * sizeof(size_t));                   \
+    auto DataLoad = __VA_ARGS__;                                                    \
+    cudaMalloc(&OUT, LIMIT * sizeof(TYPE));                                         \
+    TYPE *__host_array=(TYPE*)malloc(LIMIT * sizeof(TYPE));                         \
     for(size_t __iteration=0; __iteration < LIMIT; __iteration++)                   \
-        __host_array[__iteration] = __VA_ARGS__(__iteration);                       \
-    cudaMemcpy(OUT, __host_array, LIMIT * sizeof(size_t), cudaMemcpyHostToDevice);  \
+        __host_array[__iteration] = DataLoad(__iteration);                          \
+    cudaMemcpy(OUT, __host_array, LIMIT * sizeof(TYPE), cudaMemcpyHostToDevice);    \
 }
 #define ProblemInfoShortCut(INFO)   \
     size_t const &ndim=INFO.ndim;   \
@@ -38,12 +38,12 @@ struct MatrixInfo {
         fetch_numel = fetch_numel_;
         effective_dim = effective_dim_;
         assert(Matrix.ndimension() == __builtin_popcountll(effective_dim));
-        size_t_cuda_copy(stride, ndim, Matrix.stride);
+        CUDA_UPLOAD(size_t, stride, ndim, [&](size_t i){return Matrix.stride(i);});
     }
     __device__ scalar_t* initialize(scalar_t *memory, const size_t &offset)
-    { 
-        prev_offset=nullptr;
-        Fetch = memory + sizeof(scalar_t) * offset;
+    {
+        prev_offset = nullptr;
+        Fetch = memory + offset;
         return Fetch;
     }
 };
@@ -61,13 +61,18 @@ struct ProblemInfo {
     // .........................<-> : sharing axis
     // .....................<-----> : non reduction axis / axis of output
 
-    ProblemInfo(auto &_DIM, auto &_DIV, size_t ChunkDims) {
+    template <typename scalar_t>
+    ProblemInfo(
+        const at::TensorAccessor<scalar_t, 1> _DIM,
+        const at::TensorAccessor<scalar_t, 1> _DIV,
+        size_t ChunkDims
+    ) {
         assert(_DIM.size(0)==_DIV.size(0));
         assert(ChunkDims<_DIV.size(0));
         ndim=_DIM.size(0);
-        size_t_cuda_copy(DIM, ndim, [&](size_t i){return _DIM[i];});
-        size_t_cuda_copy(DIV, ndim, [&](size_t i){return _DIV[i];});
-        size_t_cuda_copy(BLK, ndim, [&](size_t i){return 1 + (_DIM[i] - 1) / _DIV[i];});
+        CUDA_UPLOAD(size_t, DIM, ndim, [&](size_t i){return _DIM[i];});
+        CUDA_UPLOAD(size_t, DIV, ndim, [&](size_t i){return _DIV[i];});
+        CUDA_UPLOAD(size_t, BLK, ndim, [&](size_t i){return 1 + (_DIM[i] - 1) / _DIV[i];});
         NumJobs=1; TaskSize=1; JobChunk=1;
         for(size_t i=0; i<ndim; i++)        NumJobs *=BLK[i];
         for(size_t i=0; i<ndim; i++)        TaskSize*=DIV[i];
@@ -283,5 +288,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("Get_MaxBlock", &Get_MaxBlock, "CUDA DeviceProp");
     m.def("Get_ShMem", &Get_ShMem, "CUDA DeviceProp");
     m.def("Get_WarpSize", &Get_WarpSize, "CUDA DeviceProp");
-    m.def("PlaneDot_forward", &PlaneDot_wrapper, "PlaneDot CUDA");
+    m.def("PlaneDot", &PlaneDot_wrapper, "PlaneDot CUDA");
 }
