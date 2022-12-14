@@ -7,14 +7,28 @@
 #include <cassert>
 
 
-#define CUDA_UPLOAD(TYPE, OUT, LIMIT, ...)                                            \
-{                                                                                   \
-    auto DataLoad = __VA_ARGS__;                                                    \
-    cudaMalloc(&OUT, LIMIT * sizeof(TYPE));                                         \
-    TYPE *__host_array=(TYPE*)malloc(LIMIT * sizeof(TYPE));                         \
-    for(size_t __iteration=0; __iteration < LIMIT; __iteration++)                   \
-        __host_array[__iteration] = DataLoad(__iteration);                          \
-    cudaMemcpy(OUT, __host_array, LIMIT * sizeof(TYPE), cudaMemcpyHostToDevice);    \
+#define HOST_INIT(TYPE, OUT, LIMIT, ...)                                                \
+{                                                                                       \
+    auto DataLoad = __VA_ARGS__;                                                        \
+    OUT = (TYPE*)malloc(LIMIT * sizeof(TYPE));                                          \
+    for(size_t __iteration=0; __iteration < LIMIT; __iteration++)                       \
+        OUT[__iteration] = DataLoad(__iteration);                                       \
+}
+#define CUDA_INIT(TYPE, OUT, LIMIT, ...)                                                \
+{                                                                                       \
+    auto DataLoad = __VA_ARGS__;                                                        \
+    cudaMalloc(&OUT, LIMIT * sizeof(TYPE));                                             \
+    TYPE *__host_array=(TYPE*)malloc(LIMIT * sizeof(TYPE));                             \
+    for(size_t __iteration=0; __iteration < LIMIT; __iteration++)                       \
+        __host_array[__iteration] = DataLoad(__iteration);                              \
+    cudaMemcpy(OUT, __host_array, LIMIT * sizeof(TYPE), cudaMemcpyHostToDevice);        \
+}
+#define TO_CUDA(TYPE, ARRAY, LIMIT)                                                     \
+{                                                                                       \
+    TYPE *__device_array;                                                               \
+    cudaMalloc(&__device_array, LIMIT * sizeof(TYPE));                                  \
+    cudaMemcpy(__device_array, ARRAY, LIMIT * sizeof(TYPE), cudaMemcpyHostToDevice);    \
+    ARRAY = __device_array;                                                             \
 }
 #define ProblemInfoShortCut(INFO)   \
     size_t const &ndim=INFO.ndim;   \
@@ -37,8 +51,8 @@ struct MatrixInfo {
         ndim = Matrix.ndimension();
         fetch_numel = fetch_numel_;
         effective_dim = effective_dim_;
-        assert(Matrix.ndimension() == __builtin_popcountll(effective_dim));
-        CUDA_UPLOAD(size_t, stride, ndim, [&](size_t i){return Matrix.stride(i);});
+        assert(ndim == __builtin_popcountll(effective_dim));
+        CUDA_INIT(size_t, stride, ndim, [&](size_t i){return Matrix.stride(i);});
     }
     __device__ scalar_t* initialize(scalar_t *memory, const size_t &offset)
     {
@@ -56,10 +70,10 @@ struct ProblemInfo {
     size_t TaskSize;    // equal to prod(DIV)
     size_t JobChunk;    // equal to prod(<Non-shareable-job-continuous-dimension>)
     // DIM[0:ndim] = {I J K L M N O}
-    // ...............<--->         : reduction axis -> ChunkDims = 3
-    // .....................<->     : broadcasting axis
-    // .........................<-> : sharing axis
-    // .....................<-----> : non reduction axis / axis of output
+    // .......................<---> : reduction axis -> ChunkDims = 3
+    // ...................<->       : broadcasting axis
+    // ...............<->           : sharing axis
+    // ...............<----->       : non reduction axis / axis of output
 
     template <typename scalar_t>
     ProblemInfo(
@@ -70,13 +84,16 @@ struct ProblemInfo {
         assert(_DIM.size(0)==_DIV.size(0));
         assert(ChunkDims<_DIV.size(0));
         ndim=_DIM.size(0);
-        CUDA_UPLOAD(size_t, DIM, ndim, [&](size_t i){return _DIM[i];});
-        CUDA_UPLOAD(size_t, DIV, ndim, [&](size_t i){return _DIV[i];});
-        CUDA_UPLOAD(size_t, BLK, ndim, [&](size_t i){return 1 + (_DIM[i] - 1) / _DIV[i];});
+        HOST_INIT(size_t, DIM, ndim, [&](size_t i){return _DIM[i];});
+        HOST_INIT(size_t, DIV, ndim, [&](size_t i){return _DIV[i];});
+        HOST_INIT(size_t, BLK, ndim, [&](size_t i){return 1 + (_DIM[i] - 1) / _DIV[i];});
         NumJobs=1; TaskSize=1; JobChunk=1;
         for(size_t i=0; i<ndim; i++)        NumJobs *=BLK[i];
         for(size_t i=0; i<ndim; i++)        TaskSize*=DIV[i];
-        for(size_t i=0; i<ChunkDims; i++)   JobChunk*=BLK[i];
+        for(size_t i=0; i<ChunkDims; i++)   JobChunk*=BLK[ndim-i-1];
+        TO_CUDA(size_t, DIM, ndim);
+        TO_CUDA(size_t, DIV, ndim);
+        TO_CUDA(size_t, BLK, ndim);
     }
     __device__ size_t getJobIndex(size_t worker_id, size_t worker_pool)
     { return NumJobs / JobChunk * worker_id / worker_pool * JobChunk; }
@@ -92,12 +109,9 @@ __device__ scalar_t* getBlockOffset(
 ) {
     ProblemInfoShortCut(INFO_P);
     size_t position=0, effective_dim=INFO.effective_dim;
-    for(size_t i=0, lv=0; i<ndim; index /= BLK[i++], effective_dim >>= 1)
+    for(size_t i=ndim, lv=INFO.ndim; i--; index /= BLK[i], effective_dim >>= 1)
         if(effective_dim & 1)
-        {
-            position += index % BLK[i] * INFO.stride[lv] * DIV[i];
-            lv++;
-        }
+            position += index % BLK[i] * INFO.stride[--lv] * DIV[i];
     return INFO.Mat + position;
 }
 
@@ -112,17 +126,12 @@ __device__ scalar_t* getDivisionRelativeIndex(
     // return nullptr if out-of-matrix condition
     ProblemInfoShortCut(INFO_P);
     size_t position=0, effective_dim=INFO.effective_dim;
-    for(size_t i=0, lv=0; i<ndim; JOBindex /= BLK[i], DIVindex /= DIV[i], i++, effective_dim >>= 1)
+    for(size_t i=ndim, lv=INFO.ndim; i--; JOBindex /= BLK[i], DIVindex /= DIV[i], effective_dim >>= 1)
         if(effective_dim & 1)
-        {
             if(DIM[i] > JOBindex % BLK[i] * DIV[i] + DIVindex % DIV[i])
-            {
-                position += DIVindex % DIV[i] * INFO.stride[lv];
-                lv++;
-            }
+                position += DIVindex % DIV[i] * INFO.stride[--lv];
             else
                 return nullptr;
-        }
     return offset + position;
 }
 
@@ -134,12 +143,11 @@ __device__ size_t getFetchRelativeIndex(
 ) {
     ProblemInfoShortCut(INFO_P);
     size_t position=0, stride=1, effective_dim=INFO.effective_dim;
-    for(size_t i=0, lv=0; i<ndim; index /= DIV[i++], effective_dim >>= 1)
+    for(size_t i=ndim; i--; index /= DIV[i], effective_dim >>= 1)
         if(effective_dim & 1)
         {
             position += index % DIV[i] * stride;
             stride *= DIV[i];
-            lv++;
         }
     return position;
 }
@@ -187,6 +195,8 @@ __device__ void fetchMatrix(
                 );
                 if(pointer != nullptr)
                     INFO.Fetch[DIVindex] = *pointer;
+                else
+                    INFO.Fetch[DIVindex] = 0;
             }
         else
             for(size_t DIVindex=0; DIVindex<INFO.fetch_numel; DIVindex+=Worker)
@@ -278,7 +288,7 @@ int Get_MaxBlock(at::Tensor Mat_A) {
     return at::cuda::getDeviceProperties(Mat_A.device().index())->multiProcessorCount;
 }
 int Get_ShMem(at::Tensor Mat_A) {
-    return at::cuda::getDeviceProperties(Mat_A.device().index())->sharedMemPerMultiprocessor;
+    return at::cuda::getDeviceProperties(Mat_A.device().index())->sharedMemPerBlock;
 }
 int Get_WarpSize(at::Tensor Mat_A) {
     return at::cuda::getDeviceProperties(Mat_A.device().index())->warpSize;

@@ -219,11 +219,14 @@ def execute_einsum(expression: str, Mat_A: Tensor, Mat_B: Tensor, Mat_C: Tensor,
 
     # check validation
     Mats = [Mat_A, Mat_B, Mat_C]
-    Exprs = [Expr_A, Expr_B, Expr_C] = map(set, parse_expr(expression))
+    Sub_A, Sub_B, Sub_C = parse_expr(expression)
+    Subs = [Sub_A, Sub_B, Sub_C]
+    Expr_A, Expr_B, Expr_C = map(set, Subs)
+    Exprs = [Expr_A, Expr_B, Expr_C]
     assert Expr_C.issubset(Expr_A | Expr_B)
     assert all(map(lambda x, y: x.ndim == len(y), Mats, Exprs))
     DIMs = {}
-    for Mat, Expr in zip(Mats, Exprs):
+    for Mat, Expr in zip(Mats, Subs):
         for S, E in zip(Mat.shape, Expr):
             if E not in DIMs:  # or DIMs[E] == 1:
                 DIMs[E] = S
@@ -248,16 +251,15 @@ def execute_einsum(expression: str, Mat_A: Tensor, Mat_B: Tensor, Mat_C: Tensor,
 
     opt = dict(dtype=torch.int64)
     lib.PlaneDot(
-        torch.einsum(f"{Expr_A}->{Parse_A}", Mat_A),
-        torch.einsum(f"{Expr_B}->{Parse_B}", Mat_B),
-        torch.einsum(f"{Expr_C}->{Parse_C}", Mat_C),
-        torch.tensor([DIMs[D] for D in DIM_order], **opt),
-        torch.tensor([DIV[D] for D in DIM_order], **opt),
+        torch.einsum(f"{Sub_A}->{Parse_A}", Mat_A),
+        torch.einsum(f"{Sub_B}->{Parse_B}", Mat_B),
+        torch.einsum(f"{Sub_C}->{Parse_C}", Mat_C),
+        torch.tensor([DIMs[D] for D in DIM_order[::-1]], **opt),
+        torch.tensor([DIV[D] for D in DIM_order[::-1]], **opt),
         torch.tensor(len(axis_R), **opt),
-        torch.tensor([np.prod(map(DIV.__getitem__, x)) for x in Parses], **opt),
+        torch.tensor([np.prod([DIV[i] for i in x]) for x in Parses], **opt),
         torch.tensor([effective_dim(x, DIM_order) for x in Parses], **opt),
     )
-    return Mat_C
 
 
 class FastPlaneDot(torch.autograd.Function):
