@@ -36,23 +36,35 @@ def case_generate(N, limit):
 
 
 @numba.njit()
-def case_count(depth, remain, ARR):
+def case_count(depth, max_ops, usage, ARR, apply):
     if depth == len(ARR):
         return 1
     sum = 0
-    for i in case_generate(ARR[depth], remain):
-        sum += case_count(depth + 1, remain // i, ARR)
+    remain = max_ops // usage[apply[depth]].sum()
+    if remain:
+        tmp_usage = usage.copy()
+        for i in case_generate(ARR[depth], remain):
+            tmp_usage[...] = usage
+            tmp_usage[apply[depth]] *= i
+            sum += case_count(depth + 1, max_ops, tmp_usage, ARR, apply)
     return sum
 
 
 @numba.njit()
-def case_memo(depth, remain, ARR, apply, index, stack_result, result):
+def case_memo(depth, max_ops, usage, ARR, apply, index, stack_result, result):
     if depth == len(ARR):
         result[index] = stack_result
         return index + 1
-    for i in case_generate(ARR[depth], remain):
-        stack_result[depth] = i
-        index = case_memo(depth + 1, remain // i, ARR, index, stack_result, result)
+    remain = max_ops // usage[apply[depth]].sum()
+    if remain:
+        tmp_usage = usage.copy()
+        for i in case_generate(ARR[depth], remain):
+            stack_result[depth] = i
+            tmp_usage[...] = usage
+            tmp_usage[apply[depth]] *= i
+            index = case_memo(
+                depth + 1, max_ops, tmp_usage, ARR, apply, index, stack_result, result
+            )
     return index
 
 
@@ -124,9 +136,9 @@ def plan_ops_forward(
 
     # reduce cost with
     # loop axis over (low) bgiosl -> I -> S -> B -> O -> L -> G (high)
-    # [bgiosl I] hold by warp
+    # [bgiosl I] hold by warp (or block)
     # [B S L G] divide over block
-    # 1. reduce write-back tensor_c
+    # 1. reduce write-back tensor_c (+ ignore read tensor_c)
     # 2. reduce fetch tensor_b
 
     fetch_size_gcd = np.gcd(tensor_a.element_size(), global_fetch_size)
@@ -170,7 +182,7 @@ def plan_ops_forward(
         1,
         BGOISL_blk[..., indexof("bs")].prod(-1),
     )
-    C_access_multiple = 2
+    C_access_multiple = 1
     AccessCost = (
         A_access * A_access_multiple
         + B_access * B_access_multiple
