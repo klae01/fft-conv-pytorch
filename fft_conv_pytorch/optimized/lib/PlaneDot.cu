@@ -69,6 +69,7 @@ struct ProblemInfo {
     size_t NumJobs;     // equal to prod(BLK)
     size_t TaskSize;    // equal to prod(DIV)
     size_t JobChunk;    // equal to prod(<Non-shareable-job-continuous-dimension>)
+    size_t DivChunk;    // equal to prod(<Non-shareable-div-continuous-dimension>)
     // DIM[0:ndim] = {I J K L M N O}
     // .......................<---> : reduction axis -> ChunkDims = 3
     // ...................<->       : broadcasting axis
@@ -87,37 +88,42 @@ struct ProblemInfo {
         HOST_INIT(size_t, DIM, ndim, [&](size_t i){return _DIM[i];});
         HOST_INIT(size_t, DIV, ndim, [&](size_t i){return _DIV[i];});
         HOST_INIT(size_t, BLK, ndim, [&](size_t i){return 1 + (_DIM[i] - 1) / _DIV[i];});
-        NumJobs=1; TaskSize=1; JobChunk=1;
+        NumJobs=1; TaskSize=1; JobChunk=1; DivChunk=1;
         for(size_t i=0; i<ndim; i++)        NumJobs *=BLK[i];
         for(size_t i=0; i<ndim; i++)        TaskSize*=DIV[i];
         for(size_t i=0; i<ChunkDims; i++)   JobChunk*=BLK[ndim-i-1];
+        for(size_t i=0; i<ChunkDims; i++)   DivChunk*=DIV[ndim-i-1];
         TO_CUDA(size_t, DIM, ndim);
         TO_CUDA(size_t, DIV, ndim);
         TO_CUDA(size_t, BLK, ndim);
     }
-    __device__ size_t getJobIndex(size_t worker_id, size_t worker_pool)
+    __device__ size_t getJobIndex(size_t worker_id, size_t worker_pool) const
     { return NumJobs / JobChunk * worker_id / worker_pool * JobChunk; }
-    size_t DivisibleJobCount()
+    __device__ size_t getDivIndex(size_t worker_id, size_t worker_pool) const
+    { return TaskSize / DivChunk * worker_id / worker_pool * DivChunk; }
+    size_t DivisibleJobCount() const
     { return NumJobs / JobChunk; }
+    size_t DivisibleDivCount() const
+    { return TaskSize / DivChunk; }
 };
 
 template <typename scalar_t>
 __device__ scalar_t* getBlockOffset(
-    MatrixInfo<scalar_t> &INFO,
+    const MatrixInfo<scalar_t> &INFO,
     const ProblemInfo &INFO_P,
-    size_t index
+    size_t JOBindex
 ) {
     ProblemInfoShortCut(INFO_P);
     size_t position=0, effective_dim=INFO.effective_dim;
-    for(size_t i=ndim, lv=INFO.ndim; i--; index /= BLK[i], effective_dim >>= 1)
+    for(size_t i=ndim, lv=INFO.ndim; i--; JOBindex /= BLK[i], effective_dim >>= 1)
         if(effective_dim & 1)
-            position += index % BLK[i] * INFO.stride[--lv] * DIV[i];
+            position += JOBindex % BLK[i] * INFO.stride[--lv] * DIV[i];
     return INFO.Mat + position;
 }
 
 template <typename scalar_t>
-__device__ scalar_t* getDivisionRelativeIndex(
-    MatrixInfo<scalar_t> &INFO,
+__device__ scalar_t* getDivisionPosition(
+    const MatrixInfo<scalar_t> &INFO,
     const ProblemInfo &INFO_P,
     size_t JOBindex,
     size_t DIVindex,
@@ -137,16 +143,16 @@ __device__ scalar_t* getDivisionRelativeIndex(
 
 template <typename scalar_t>
 __device__ size_t getFetchRelativeIndex(
-    MatrixInfo<scalar_t> &INFO,
+    const MatrixInfo<scalar_t> &INFO,
     const ProblemInfo &INFO_P,
-    size_t index
+    size_t DIVindex
 ) {
     ProblemInfoShortCut(INFO_P);
     size_t position=0, stride=1, effective_dim=INFO.effective_dim;
-    for(size_t i=ndim; i--; index /= DIV[i], effective_dim >>= 1)
+    for(size_t i=ndim; i--; DIVindex /= DIV[i], effective_dim >>= 1)
         if(effective_dim & 1)
         {
-            position += index % DIV[i] * stride;
+            position += DIVindex % DIV[i] * stride;
             stride *= DIV[i];
         }
     return position;
@@ -155,14 +161,14 @@ __device__ size_t getFetchRelativeIndex(
 template <typename scalar_t>
 __device__ void writebackMatrix(
     MatrixInfo<scalar_t> &INFO,
-    const ProblemInfo &INFO_P,
-    const size_t &Worker
+    const ProblemInfo &INFO_P
 ) {
+    // TODO: P2, use restrict qualifier
     scalar_t *pointer;
     if(INFO.prev_offset != nullptr)
-        for(size_t DIVindex=0; DIVindex<INFO.fetch_numel; DIVindex+=Worker)
+        for(size_t DIVindex=0; DIVindex<INFO.fetch_numel; DIVindex+=blockDim.x)
         {
-            pointer = getDivisionRelativeIndex<scalar_t>(
+            pointer = getDivisionPosition<scalar_t>(
                 INFO, INFO_P, INFO.last_Jobindex, DIVindex, INFO.prev_offset
             );
             if(pointer != nullptr)
@@ -174,23 +180,23 @@ template <bool loadfetch, bool writeback, typename scalar_t>
 __device__ void fetchMatrix(
     MatrixInfo<scalar_t> &INFO,
     const ProblemInfo &INFO_P,
-    const size_t &JOBindex,
-    const size_t &Worker
+    const size_t &JOBindex
 ) {
+    // TODO: P2, use restrict qualifier
     scalar_t *offset = getBlockOffset<scalar_t>(INFO, INFO_P, JOBindex);
     scalar_t *pointer;
     if(INFO.prev_offset != offset)
     {
         if(writeback)
         {
-            writebackMatrix<scalar_t>(INFO, INFO_P, Worker);
+            writebackMatrix<scalar_t>(INFO, INFO_P);
             INFO.last_Jobindex = JOBindex;
         }
         if(loadfetch)
             // TODO: P0, pointer is not global memory frendly
-            for(size_t DIVindex=0; DIVindex<INFO.fetch_numel; DIVindex+=Worker)
+            for(size_t DIVindex=0; DIVindex<INFO.fetch_numel; DIVindex+=blockDim.x)
             {
-                pointer = getDivisionRelativeIndex<scalar_t>(
+                pointer = getDivisionPosition<scalar_t>(
                     INFO, INFO_P, JOBindex, DIVindex, offset
                 );
                 if(pointer != nullptr)
@@ -199,7 +205,7 @@ __device__ void fetchMatrix(
                     INFO.Fetch[DIVindex] = 0;
             }
         else
-            for(size_t DIVindex=0; DIVindex<INFO.fetch_numel; DIVindex+=Worker)
+            for(size_t DIVindex=0; DIVindex<INFO.fetch_numel; DIVindex+=blockDim.x)
                 INFO.Fetch[DIVindex] = 0;
     }
     INFO.prev_offset = offset;
@@ -210,11 +216,10 @@ __device__ void accFetch(
     MatrixInfo<scalar_t> &INFO_A,
     MatrixInfo<scalar_t> &INFO_B,
     MatrixInfo<scalar_t> &INFO_C,
-    const ProblemInfo &INFO_P,
-    const size_t &Worker
+    const ProblemInfo &INFO_P
 ) {
     // TODO: P0, reduction axis do not share over thread
-    for(size_t i=0; i<INFO_P.TaskSize; i+=Worker)
+    for(size_t i=0; i<INFO_P.TaskSize; i+=blockDim.x)
         INFO_C.Fetch[getFetchRelativeIndex<scalar_t>(INFO_C, INFO_P, i)] += (
             INFO_A.Fetch[getFetchRelativeIndex<scalar_t>(INFO_A, INFO_P, i)]
             * 
@@ -227,7 +232,7 @@ __global__ void PlaneDot(
     MatrixInfo<scalar_t> INFO_A,
     MatrixInfo<scalar_t> INFO_B,
     MatrixInfo<scalar_t> INFO_C,
-    ProblemInfo INFO_P
+    const ProblemInfo INFO_P
 ) {
     extern __shared__ __align__(sizeof(scalar_t)) unsigned char sdata_uchar[];
     scalar_t *fetch = reinterpret_cast<scalar_t *>(sdata_uchar);
@@ -240,14 +245,14 @@ __global__ void PlaneDot(
 
     for(; JOBindex < JOBlast; JOBindex++)
     {
-        fetchMatrix<true, false, scalar_t>(INFO_A, INFO_P, JOBindex, blockDim.x);
-        fetchMatrix<true, false, scalar_t>(INFO_B, INFO_P, JOBindex, blockDim.x);
-        fetchMatrix<false, true, scalar_t>(INFO_C, INFO_P, JOBindex, blockDim.x);
+        fetchMatrix<true, false, scalar_t>(INFO_A, INFO_P, JOBindex);
+        fetchMatrix<true, false, scalar_t>(INFO_B, INFO_P, JOBindex);
+        fetchMatrix<false, true, scalar_t>(INFO_C, INFO_P, JOBindex);
         __syncthreads();
-        accFetch<scalar_t>(INFO_A, INFO_B, INFO_C, INFO_P, blockDim.x);
+        accFetch<scalar_t>(INFO_A, INFO_B, INFO_C, INFO_P);
         __syncthreads();
     }
-    writebackMatrix<scalar_t>(INFO_C, INFO_P, blockDim.x);
+    writebackMatrix<scalar_t>(INFO_C, INFO_P);
 }
 
 void determin_task_divide(size_t works, size_t device, size_t&nBlock, size_t&nThread) {
