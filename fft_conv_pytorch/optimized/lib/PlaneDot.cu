@@ -231,9 +231,9 @@ __device__ void accFetch(
     const MatrixInfo<scalar_t> &INFO_A,
     const MatrixInfo<scalar_t> &INFO_B,
     const MatrixInfo<scalar_t> &INFO_C,
-    scalar_t *Fetch_A,
-    scalar_t *Fetch_B,
-    scalar_t *Fetch_C,
+    const scalar_t* __restrict Fetch_A,
+    const scalar_t* __restrict Fetch_B,
+    scalar_t* __restrict__ Fetch_C,
     const ProblemInfo &INFO_P
 ) {
     // TODO: P0, reduction axis do not share over thread
@@ -241,12 +241,18 @@ __device__ void accFetch(
     size_t DIVindex=INFO_P.getDivIndex(threadIdx.x, blockDim.x);
     size_t DIVlast=INFO_P.getDivIndex(threadIdx.x+1, blockDim.x);
 
-    for(; DIVindex < DIVlast; DIVindex++)
-        Fetch_C[getFetchRelativeIndex<scalar_t>(INFO_C, INFO_P, DIVindex)] += (
-            Fetch_A[getFetchRelativeIndex<scalar_t>(INFO_A, INFO_P, DIVindex)]
-            * 
-            Fetch_B[getFetchRelativeIndex<scalar_t>(INFO_B, INFO_P, DIVindex)]
-        );
+    for(; DIVindex < DIVlast;)
+    {
+        scalar_t sum=0;
+        size_t DIVsublast = DIVindex + INFO_P.DivChunk;
+        for(; DIVindex < DIVsublast; DIVindex++)
+            sum += (
+                Fetch_A[getFetchRelativeIndex<scalar_t>(INFO_A, INFO_P, DIVindex)]
+                * 
+                Fetch_B[getFetchRelativeIndex<scalar_t>(INFO_B, INFO_P, DIVindex)]
+            );
+        Fetch_C[getFetchRelativeIndex<scalar_t>(INFO_C, INFO_P, DIVsublast - 1)] += sum;
+    }
 }
 
 template <typename scalar_t>
