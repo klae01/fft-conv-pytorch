@@ -135,18 +135,21 @@ __device__ scalar_t* getDivisionPosition(
     const MatrixInfo<scalar_t> &INFO,
     const ProblemInfo &INFO_P,
     size_t JOBindex,
-    size_t DIVindex,
+    size_t FDIVindex,
     scalar_t * const &offset
 ) {
     // return nullptr if out-of-matrix condition
     ProblemInfoShortCut(INFO_P);
     size_t position=0, effective_dim=INFO.effective_dim;
-    for(size_t i=ndim, lv=INFO.ndim; i--; JOBindex /= BLK[i], DIVindex /= DIV[i], effective_dim >>= 1)
+    for(size_t i=ndim, lv=INFO.ndim; i--; JOBindex /= BLK[i], effective_dim >>= 1)
         if(effective_dim & 1)
-            if(DIM[i] > JOBindex % BLK[i] * DIV[i] + DIVindex % DIV[i])
-                position += DIVindex % DIV[i] * INFO.stride[--lv];
+        {
+            if(DIM[i] > JOBindex % BLK[i] * DIV[i] + FDIVindex % DIV[i])
+                position += FDIVindex % DIV[i] * INFO.stride[--lv];
             else
                 return nullptr;
+            FDIVindex /= DIV[i];
+        }
     return offset + position;
 }
 
@@ -174,15 +177,14 @@ __device__ void writebackMatrix(
     const ProblemInfo &INFO_P
 ) {
     // TODO: P2, use restrict qualifier
-    scalar_t *pointer;
     if(TASK.prev_offset != nullptr)
-        for(size_t DIVindex=threadIdx.x; DIVindex<INFO.fetch_numel; DIVindex+=blockDim.x)
+        for(size_t FDIVindex=threadIdx.x; FDIVindex<INFO.fetch_numel; FDIVindex+=blockDim.x)
         {
-            pointer = getDivisionPosition<scalar_t>(
-                INFO, INFO_P, TASK.last_Jobindex, DIVindex, TASK.prev_offset
+            scalar_t *pointer = getDivisionPosition<scalar_t>(
+                INFO, INFO_P, TASK.last_Jobindex, FDIVindex, TASK.prev_offset
             );
             if(pointer != nullptr)
-                *pointer = TASK.Fetch[DIVindex];
+                *pointer = TASK.Fetch[FDIVindex];
         }
 }
 
@@ -195,7 +197,6 @@ __device__ void fetchMatrix(
 ) {
     // TODO: P2, use restrict qualifier
     __shared__ scalar_t *offset;
-    scalar_t *pointer;
     RepThreadBegin
         offset  =   getBlockOffset<scalar_t>(INFO, INFO_P, JOBindex);
     RepThreadEnd
@@ -205,19 +206,19 @@ __device__ void fetchMatrix(
             writebackMatrix<scalar_t>(INFO, TASK, INFO_P);
         if(loadfetch)
             // TODO: P0, pointer is not global memory frendly
-            for(size_t DIVindex=threadIdx.x; DIVindex<INFO.fetch_numel; DIVindex+=blockDim.x)
+            for(size_t FDIVindex=threadIdx.x; FDIVindex<INFO.fetch_numel; FDIVindex+=blockDim.x)
             {
-                pointer = getDivisionPosition<scalar_t>(
-                    INFO, INFO_P, JOBindex, DIVindex, offset
+                scalar_t *pointer = getDivisionPosition<scalar_t>(
+                    INFO, INFO_P, JOBindex, FDIVindex, offset
                 );
                 if(pointer != nullptr)
-                    TASK.Fetch[DIVindex] = *pointer;
+                    TASK.Fetch[FDIVindex] = *pointer;
                 else
-                    TASK.Fetch[DIVindex] = 0;
+                    TASK.Fetch[FDIVindex] = 0;
             }
         else
-            for(size_t DIVindex=threadIdx.x; DIVindex<INFO.fetch_numel; DIVindex+=blockDim.x)
-                TASK.Fetch[DIVindex] = 0;
+            for(size_t FDIVindex=threadIdx.x; FDIVindex<INFO.fetch_numel; FDIVindex+=blockDim.x)
+                TASK.Fetch[FDIVindex] = 0;
         RepThreadBegin
             TASK.prev_offset    =   offset;
             TASK.last_Jobindex  =   JOBindex;
