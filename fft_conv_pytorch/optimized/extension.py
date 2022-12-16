@@ -1,6 +1,9 @@
-import torch
-import numpy as np
+from functools import lru_cache
+from typing import Tuple
+
 import numba
+import numpy as np
+import torch
 from torch import Tensor
 
 from .lib import cpu, cuda
@@ -69,16 +72,20 @@ def case_memo(depth, max_ops, usage, ARR, apply, index, stack_result, result):
 
 
 @torch.no_grad()
-def memory_access_count(DIM: np.ndarray, DIV: np.ndarray, stride: list, chunksize: int):
+def memory_access_count(
+    DIM: np.ndarray, DIV: np.ndarray, stride: list, chunksize: int, offset: int
+):
     # bottom up, memory shift 0 ~ chunksize, all case cache
     # ignore out of range
     # TODO: P1, consider offset
+    assert DIM.ndim == 1
     u_DIV, indices = np.unique(DIV, axis=0, return_inverse=True)
 
     result = torch.zeros([u_DIV.shape[0]], dtype=torch.float32)
     cpu.AccessCost(
-        torch.tensor([DIM.shape[0]]).type(torch.int64),
+        torch.tensor(len(DIM)).type(torch.int64),
         torch.tensor(chunksize).type(torch.int64),
+        torch.tensor(offset).type(torch.int64),
         torch.from_numpy(DIM.astype(np.int64)),
         torch.tensor(stride).type(torch.int64),
         torch.from_numpy(u_DIV.astype(np.int64)),
@@ -87,19 +94,25 @@ def memory_access_count(DIM: np.ndarray, DIV: np.ndarray, stride: list, chunksiz
     return result.numpy()[indices]
 
 
-def plan_ops_forward(
-    tensor_a: Tensor, tensor_b: Tensor, tensor_c: Tensor, lib
-) -> Tensor:
+@lru_cache(2**20)
+def __plan_ops_forward(
+    bgoisl,
+    nBlock: int,
+    nThreads: int,
+    ShMem: int,
+    element_size: int,
+    a_stride: Tuple,
+    b_stride: Tuple,
+    c_stride: Tuple,
+    a_storage_offset: int,
+    b_storage_offset: int,
+    c_storage_offset: int,
+) -> np.ndarray:
     def indexof(s: str):
         return ["bgoisl".index(i) for i in s]
 
-    b, g, i, s, l = tensor_a.shape
-    g, o, i, l = tensor_b.shape
-    BGOISL = np.asarray([b, g, o, i, s, l], dtype=np.uint64)
-    nBlock = lib.Get_MaxBlock(tensor_a)
-    nThreads = lib.Get_WarpSize(tensor_a)
-    ShMem = lib.Get_ShMem(tensor_a)
-    ShElem = ShMem // tensor_a.element_size()
+    BGOISL = np.asarray(bgoisl, dtype=np.uint64)
+    ShElem = ShMem // element_size
     global_fetch_size = 128
     Eff_ShElem = ShElem - nThreads * 4
 
@@ -141,8 +154,8 @@ def plan_ops_forward(
     # 1. reduce write-back tensor_c (+ ignore read tensor_c)
     # 2. reduce fetch tensor_b
 
-    fetch_size_gcd = np.gcd(tensor_a.element_size(), global_fetch_size)
-    element_rescale = tensor_a.element_size() // fetch_size_gcd
+    fetch_size_gcd = np.gcd(element_size, global_fetch_size)
+    element_rescale = element_size // fetch_size_gcd
     fetch_rescale = global_fetch_size // fetch_size_gcd
 
     BGOISL_ReScale = BGOISL.copy()
@@ -156,20 +169,23 @@ def plan_ops_forward(
     A_access = memory_access_count(
         BGOISL_ReScale[A_axis],
         BGOISL_div_ReScale[..., A_axis],
-        tensor_a.stride(),
+        a_stride,
         fetch_rescale,
+        a_storage_offset,
     )
     B_access = memory_access_count(
         BGOISL_ReScale[B_axis],
         BGOISL_div_ReScale[..., B_axis],
-        tensor_b.stride(),
+        b_stride,
         fetch_rescale,
+        b_storage_offset,
     )
     C_access = memory_access_count(
         BGOISL_ReScale[C_axis],
         BGOISL_div_ReScale[..., C_axis],
-        tensor_c.stride(),
+        c_stride,
         fetch_rescale,
+        c_storage_offset,
     )
 
     A_access_multiple = np.where(
@@ -198,7 +214,29 @@ def plan_ops_forward(
     )
     cost = AccessCost + Schedule
     index = cost.argmin()
-    return torch.from_numpy(BGOISL_div[index].astype(np.int64))
+    return BGOISL_div[index].astype(np.int64)
+
+
+def plan_ops_forward(
+    tensor_a: Tensor, tensor_b: Tensor, tensor_c: Tensor, lib
+) -> Tensor:
+    b, g, i, s, l = tensor_a.shape
+    g, o, i, l = tensor_b.shape
+    return torch.from_numpy(
+        __plan_ops_forward(
+            (b, g, o, i, s, l),
+            lib.Get_MaxBlock(tensor_a),
+            lib.Get_WarpSize(tensor_a),
+            lib.Get_ShMem(tensor_a),
+            tensor_a.element_size(),
+            tuple(tensor_a.stride()),
+            tuple(tensor_b.stride()),
+            tuple(tensor_c.stride()),
+            tensor_a.storage_offset(),
+            tensor_b.storage_offset(),
+            tensor_c.storage_offset(),
+        )
+    )
 
 
 def parse_expr(expression: str):

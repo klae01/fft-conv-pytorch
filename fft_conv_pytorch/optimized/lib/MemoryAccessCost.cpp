@@ -2,6 +2,7 @@
 #include <torch/extension.h>
 
 #include <algorithm>
+#include <cassert>
 using namespace std;
 
 template<typename T>
@@ -66,7 +67,8 @@ acctype access_counter(
     const at::TensorAccessor<datatype, 1> DIM,
     const at::TensorAccessor<datatype, 1> DIV,
     const at::TensorAccessor<datatype, 1> stride,
-    const datatype chunksize
+    const datatype chunksize,
+    const datatype offset
 ) {
     vector<acctype> prev_access(chunksize, 1);
     vector<acctype> curr_access(chunksize);
@@ -121,25 +123,27 @@ acctype access_counter(
         swap(prev_access, curr_access);
         swap(prev_remain, curr_remain);
     }
-    return prev_access[0];
+    return prev_access[offset];
 }
 void access_count_wrapper(
-    at::Tensor ndim, // shared, shape [1]
+    at::Tensor ndim, // shared, shape []
     at::Tensor chunksize, // shared, shape []
+    at::Tensor offset, // shared, shape []
     at::Tensor DIM, // shared, shape [ndim]
     at::Tensor stride, // shared, shape [ndim]
     at::Tensor DIV, // non shared, shape [tasksize, ndim]
     at::Tensor result // non shared, shape [tasksize]
 ) {
     AT_DISPATCH_INTEGRAL_TYPES(DIM.type(), "Access Count", ([&] {
-        scalar_t NDIM = ndim.accessor<scalar_t,1>()[0];
+        scalar_t NDIM = ndim.item<scalar_t>();
         scalar_t CHUNK = chunksize.item<scalar_t>();
+        scalar_t OFFSET = offset.item<scalar_t>() % CHUNK;
         auto DIM_pt=DIM.accessor<scalar_t,1>();
         auto stride_pt=stride.accessor<scalar_t,1>();
         auto DIV_pt=DIV.accessor<scalar_t,2>();
         for(size_t i=0; i<result.sizes()[0]; i++)
             result[i] = access_counter<scalar_t, float> (
-                NDIM, DIM_pt, DIV_pt[i], stride_pt, CHUNK
+                NDIM, DIM_pt, DIV_pt[i], stride_pt, CHUNK, OFFSET
             );
     }));
 }

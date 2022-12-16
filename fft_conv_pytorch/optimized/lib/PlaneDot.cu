@@ -47,7 +47,7 @@ struct MatrixInfo {
     size_t fetch_numel;
     size_t effective_dim;
     MatrixInfo(at::Tensor &Matrix, size_t fetch_numel_, size_t effective_dim_) {
-        Mat = Matrix.data_ptr<scalar_t>();
+        Mat = Matrix.data_ptr<scalar_t>() + Matrix.storage_offset();
         ndim = Matrix.ndimension();
         fetch_numel = fetch_numel_;
         effective_dim = effective_dim_;
