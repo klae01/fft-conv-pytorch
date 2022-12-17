@@ -1,5 +1,6 @@
+import itertools
 from functools import lru_cache
-from typing import Tuple
+from typing import Dict, Tuple, List
 
 import numba
 import numpy as np
@@ -7,6 +8,10 @@ import torch
 from torch import Tensor
 
 from .lib import cpu, cuda
+
+
+FETCH_SIZE_LIMIT = 2**16
+FETCH_INDEXING_DTYPE = torch.int16
 
 
 def RaiseNotImplementedError(str):
@@ -32,10 +37,10 @@ def case_generate(N, limit):
     SQ = int(np.ceil(np.sqrt(N))) + 1
     while SQ * SQ > N:
         SQ -= 1
-    for x in range(1, min(limit + 1, SQ)):
+    for x in range(1, min(limit, SQ) + 1):
         yield x
-    for x in range((N + limit - 1) // limit, SQ + 1):
-        yield N // x
+    for x in range(SQ - 1 if SQ == (N + SQ - 1) // SQ else SQ, (N - 1) // limit, -1):
+        yield (N + x - 1) // x
 
 
 @numba.njit()
@@ -43,12 +48,14 @@ def case_count(depth, max_ops, usage, ARR, apply):
     if depth == len(ARR):
         return 1
     sum = 0
-    remain = max_ops // usage[apply[depth]].sum()
-    if remain:
+    remain = min(
+        (max_ops - usage[~apply[depth]].sum()) // usage[apply[depth]].sum(),
+        FETCH_SIZE_LIMIT // usage[apply[depth]].max(),
+    )
+    if remain > 0:
         tmp_usage = usage.copy()
         for i in case_generate(ARR[depth], remain):
-            tmp_usage[...] = usage
-            tmp_usage[apply[depth]] *= i
+            tmp_usage[apply[depth]] = i * usage[apply[depth]]
             sum += case_count(depth + 1, max_ops, tmp_usage, ARR, apply)
     return sum
 
@@ -58,13 +65,15 @@ def case_memo(depth, max_ops, usage, ARR, apply, index, stack_result, result):
     if depth == len(ARR):
         result[index] = stack_result
         return index + 1
-    remain = max_ops // usage[apply[depth]].sum()
-    if remain:
+    remain = min(
+        (max_ops - usage[~apply[depth]].sum()) // usage[apply[depth]].sum(),
+        FETCH_SIZE_LIMIT // usage[apply[depth]].max(),
+    )
+    if remain > 0:
         tmp_usage = usage.copy()
         for i in case_generate(ARR[depth], remain):
             stack_result[depth] = i
-            tmp_usage[...] = usage
-            tmp_usage[apply[depth]] *= i
+            tmp_usage[apply[depth]] = i * usage[apply[depth]]
             index = case_memo(
                 depth + 1, max_ops, tmp_usage, ARR, apply, index, stack_result, result
             )
@@ -94,24 +103,91 @@ def memory_access_count(
     return result.numpy()[indices]
 
 
+def parse_expr(expression: str):
+    op1, op2 = expression.split("->")
+    return map(lambda x: x.strip(), [*op1.split(","), op2])
+
+
+def axis_classify(Expr_A: str, Expr_B: str, Expr_C: str):
+    Expr_A, Expr_B, Expr_C = map(set, [Expr_A, Expr_B, Expr_C])
+    return map(
+        lambda x: "".join(sorted(x)),
+        [
+            Expr_A & Expr_B - Expr_C,
+            Expr_A & Expr_C - Expr_B,
+            Expr_B & Expr_C - Expr_A,
+            Expr_A & Expr_B & Expr_C,
+        ],
+    )
+
+
+def axis_size_matching_validation(*MAPs: List[Dict]):
+    def _sub(MAP_X: Dict, MAP_Y: Dict):
+        for k in MAP_X.keys():
+            if k in MAP_Y:
+                assert MAP_X[k] == MAP_Y[k]
+
+    [_sub(*I) for I in itertools.combinations(MAPs, 2)]
+
+
+def axis_validation(
+    Expr_A: str,
+    Expr_B: str,
+    Expr_C: str,
+    a_shape: Tuple[int],
+    b_shape: Tuple[int],
+    c_shape: Tuple[int],
+):
+    # allow up to 32 dimension
+    assert max(map(len, [Expr_A, Expr_B, Expr_C])) <= 32
+    # do not allow trace
+    assert all(map(lambda x: len(x) == len(set(x)), [Expr_A, Expr_B, Expr_C]))
+    # do not allow broadcast or unmatched length
+    axis_size_matching_validation(
+        dict(zip(Expr_A, a_shape)),
+        dict(zip(Expr_B, b_shape)),
+        dict(zip(Expr_C, c_shape)),
+    )
+
+
 @lru_cache(2**20)
-def __plan_ops_forward(
-    bgoisl,
+def __plan_ops(
+    expression: str,
     nBlock: int,
     nThreads: int,
     ShMem: int,
     element_size: int,
-    a_stride: Tuple,
-    b_stride: Tuple,
-    c_stride: Tuple,
+    a_shape: Tuple[int],
+    b_shape: Tuple[int],
+    c_shape: Tuple[int],
+    a_stride: Tuple[int],
+    b_stride: Tuple[int],
+    c_stride: Tuple[int],
     a_storage_offset: int,
     b_storage_offset: int,
     c_storage_offset: int,
 ) -> np.ndarray:
     def indexof(s: str):
-        return ["bgoisl".index(i) for i in s]
+        nonlocal AXIS_ORDER
+        return [AXIS_ORDER.index(i) for i in s]
 
-    BGOISL = np.asarray(bgoisl, dtype=np.uint64)
+    Expr_A, Expr_B, Expr_C = parse_expr(expression)
+    axis_validation(Expr_A, Expr_B, Expr_C, a_shape, b_shape, c_shape)
+    axis_size = dict(
+        [
+            *zip(Expr_A, a_shape),
+            *zip(Expr_B, b_shape),
+            *zip(Expr_C, c_shape),
+        ]
+    )
+    AXIS_ORDER = "".join(axis_size.keys())
+    SIZE = np.asarray([axis_size[i] for i in AXIS_ORDER], dtype=np.int64)
+
+    # reduction axis ( A & B axis )
+    # broadcast from A ( A & C axis )
+    # broadcast from B ( B & C axis )
+    # shared axis ( A & B & C axis )
+    axis_R, axis_A, axis_B, axis_S = axis_classify(Expr_A, Expr_B, Expr_C)
     ShElem = ShMem // element_size
     global_fetch_size = 128
     Eff_ShElem = ShElem - nThreads * 4
@@ -119,33 +195,30 @@ def __plan_ops_forward(
     if Eff_ShElem <= 0:
         RuntimeError(f"not enough shared memory (L1) size : {ShMem} Bytes found")
 
-    apply = np.full([len(BGOISL), 3], False, bool)
-    apply[indexof("bgisl"), 0] = True
-    apply[indexof("goil"), 1] = True
-    apply[indexof("bgosl"), 2] = True
-    BGOISL_div = np.empty(
-        [case_count(0, Eff_ShElem, np.ones([3]), BGOISL, apply), len(BGOISL)],
-        dtype=np.uint64,
-    )  # block dimmension
+    apply = np.full([len(SIZE), 3], False, bool)
+    apply[indexof(Expr_A), 0] = True
+    apply[indexof(Expr_B), 1] = True
+    apply[indexof(Expr_C), 2] = True
+    # block: data share over SM
+    # block dimmension
+    DIV = np.empty(
+        [
+            case_count(0, Eff_ShElem, np.ones([3], dtype=np.int64), SIZE, apply),
+            len(SIZE),
+        ],
+        dtype=np.int64,
+    )
     case_memo(
         0,
         Eff_ShElem,
-        np.ones([3]),
-        BGOISL,
+        np.ones([3], dtype=np.int64),
+        SIZE,
         apply,
         0,
-        np.empty_like(BGOISL_div[0]),
-        BGOISL_div,
+        np.empty_like(DIV[0], dtype=np.int64),
+        DIV,
     )
-
-    # block: data share over SM
-    A_blk_size = BGOISL_div[..., indexof("bgisl")].prod(-1)
-    B_blk_size = BGOISL_div[..., indexof("goil")].prod(-1)
-    C_blk_size = BGOISL_div[..., indexof("bgosl")].prod(-1)
-    valid_index = (A_blk_size + B_blk_size + C_blk_size) <= Eff_ShElem
-    del A_blk_size, B_blk_size, C_blk_size
-    BGOISL_div = BGOISL_div[valid_index]
-    BGOISL_blk = (BGOISL + BGOISL_div - 1) // BGOISL_div  # block count
+    BLK = (SIZE + DIV - 1) // DIV  # block count
 
     # reduce cost with
     # loop axis over (low) bgiosl -> I -> S -> B -> O -> L -> G (high)
@@ -158,45 +231,42 @@ def __plan_ops_forward(
     element_rescale = element_size // fetch_size_gcd
     fetch_rescale = global_fetch_size // fetch_size_gcd
 
-    BGOISL_ReScale = BGOISL.copy()
-    BGOISL_div_ReScale = BGOISL_div.copy()
-    BGOISL_ReScale[-1] *= element_rescale
-    BGOISL_div_ReScale[..., -1] *= element_rescale
+    SIZE_ReScale = SIZE.copy()
+    DIV_ReScale = DIV.copy()
+    SIZE_ReScale[-1] *= element_rescale
+    DIV_ReScale[..., -1] *= element_rescale
 
-    A_axis = indexof("bgisl")
-    B_axis = indexof("goil")
-    C_axis = indexof("bgosl")
     A_access = memory_access_count(
-        BGOISL_ReScale[A_axis],
-        BGOISL_div_ReScale[..., A_axis],
+        SIZE_ReScale[indexof(Expr_A)],
+        DIV_ReScale[..., indexof(Expr_A)],
         a_stride,
         fetch_rescale,
         a_storage_offset,
     )
     B_access = memory_access_count(
-        BGOISL_ReScale[B_axis],
-        BGOISL_div_ReScale[..., B_axis],
+        SIZE_ReScale[indexof(Expr_B)],
+        DIV_ReScale[..., indexof(Expr_B)],
         b_stride,
         fetch_rescale,
         b_storage_offset,
     )
     C_access = memory_access_count(
-        BGOISL_ReScale[C_axis],
-        BGOISL_div_ReScale[..., C_axis],
+        SIZE_ReScale[indexof(Expr_C)],
+        DIV_ReScale[..., indexof(Expr_C)],
         c_stride,
         fetch_rescale,
         c_storage_offset,
     )
 
     A_access_multiple = np.where(
-        (BGOISL_blk[..., indexof("ibs")] == 1).all(-1),
+        (BLK[..., indexof(axis_R + axis_A)] == 1).all(-1),
         1,
-        BGOISL_blk[..., indexof("o")].prod(-1),
+        BLK[..., indexof(axis_B)].prod(-1),
     )
     B_access_multiple = np.where(
-        (BGOISL_blk[..., indexof("i")] == 1).all(-1),
+        (BLK[..., indexof(axis_R)] == 1).all(-1),
         1,
-        BGOISL_blk[..., indexof("bs")].prod(-1),
+        BLK[..., indexof(axis_A)].prod(-1),
     )
     C_access_multiple = 1
     AccessCost = (
@@ -205,43 +275,53 @@ def __plan_ops_forward(
         + C_access * C_access_multiple
     )
     Schedule = (
-        np.ceil(BGOISL_blk[..., indexof("bgosl")].prod(-1) / nBlock)  # Block level
-        * BGOISL_blk[..., indexof("i")[0]]  # non-shareable dimmension
+        np.ceil(BLK[..., indexof(Expr_C)].prod(-1) / nBlock)  # Block level
+        * BLK[..., indexof(axis_R)].prod(-1)  # non-shareable dimmension
         * (
-            np.ceil(BGOISL_div.prod(-1) / nThreads)  # Warp level Prod-Sum ops
+            np.ceil(DIV.prod(-1) / nThreads)  # Warp level Prod-Sum ops
             + 1200  # Global memory load latency
         )
     )
     cost = AccessCost + Schedule
     index = cost.argmin()
-    return BGOISL_div[index].astype(np.int64)
+    return cost[index], SIZE, DIV[index], BLK[index], AXIS_ORDER
 
 
-def plan_ops_forward(
-    tensor_a: Tensor, tensor_b: Tensor, tensor_c: Tensor, lib
+def plan_ops(
+    expression: str, tensor_a: Tensor, tensor_b: Tensor, tensor_c: Tensor, lib
 ) -> Tensor:
-    b, g, i, s, l = tensor_a.shape
-    g, o, i, l = tensor_b.shape
-    return torch.from_numpy(
-        __plan_ops_forward(
-            (b, g, o, i, s, l),
-            lib.Get_MaxBlock(tensor_a),
-            lib.Get_WarpSize(tensor_a),
-            lib.Get_ShMem(tensor_a),
-            tensor_a.element_size(),
-            tuple(tensor_a.stride()),
-            tuple(tensor_b.stride()),
-            tuple(tensor_c.stride()),
-            tensor_a.storage_offset(),
-            tensor_b.storage_offset(),
-            tensor_c.storage_offset(),
-        )
+    def kerf_info(expr):
+        nonlocal DIM, DIV, AXIS
+        flag = 0
+        case = []
+        for i, j in enumerate(map(AXIS.index, expr)):
+            remain = DIM[j] % DIV[j]
+            if remain != 0:
+                flag += 1 << i
+                case.append([DIV[i], remain])
+            else:
+                case.append(DIV[i])
+        return flag, case
+
+    Expr_A, Expr_B, Expr_C = parse_expr(expression)
+
+    COST, DIM, DIV, BLK, AXIS = __plan_ops(
+        expression,
+        lib.Get_MaxBlock(tensor_a),
+        lib.Get_WarpSize(tensor_a),
+        lib.Get_ShMem(tensor_a),
+        tensor_a.element_size(),
+        tuple(tensor_a.shape),
+        tuple(tensor_b.shape),
+        tuple(tensor_c.shape),
+        tuple(tensor_a.stride()),
+        tuple(tensor_b.stride()),
+        tuple(tensor_c.stride()),
+        tensor_a.storage_offset(),
+        tensor_b.storage_offset(),
+        tensor_c.storage_offset(),
     )
-
-
-def parse_expr(expression: str):
-    op1, op2 = expression.split("->")
-    return map(lambda x: x.strip(), [*op1.split(","), op2])
+    return torch.tensor([DIV[AXIS.index(i)] for i in "bgoisl"])
 
 
 def execute_einsum(expression: str, Mat_A: Tensor, Mat_B: Tensor, Mat_C: Tensor, lib):
