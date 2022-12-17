@@ -82,7 +82,7 @@ def case_memo(depth, max_ops, usage, ARR, apply, index, stack_result, result):
 
 @torch.no_grad()
 def memory_access_count(
-    DIM: np.ndarray, DIV: np.ndarray, stride: list, chunksize: int, offset: int
+    DIM: np.ndarray, DIV: np.ndarray, stride: Tuple[int], chunksize: int, offset: int
 ):
     # bottom up, memory shift 0 ~ chunksize, all case cache
     # ignore out of range
@@ -231,31 +231,39 @@ def __plan_ops(
     element_rescale = element_size // fetch_size_gcd
     fetch_rescale = global_fetch_size // fetch_size_gcd
 
-    SIZE_ReScale = SIZE.copy()
-    DIV_ReScale = DIV.copy()
-    SIZE_ReScale[-1] *= element_rescale
-    DIV_ReScale[..., -1] *= element_rescale
+    ReScale = lambda C: lambda X: X if element_rescale == 0 else C(X)
+    RS_SIZE = ReScale(lambda X: np.concatenate([X, [element_rescale]], dtype=X.dtype))
+    RS_DIV = ReScale(
+        lambda X: np.concatenate(
+            [X, np.broadcast_to([element_rescale], [X.shape[0], 1])],
+            axis=-1,
+            dtype=X.dtype,
+        )
+    )
+    RS_Stride = ReScale(lambda X: tuple([x * element_rescale for x in X] + [1]))
+    RS_Chunk = ReScale(lambda X: X)
+    RS_Offset = ReScale(lambda X: X * element_rescale)
 
     A_access = memory_access_count(
-        SIZE_ReScale[indexof(Expr_A)],
-        DIV_ReScale[..., indexof(Expr_A)],
-        a_stride,
-        fetch_rescale,
-        a_storage_offset,
+        RS_SIZE(SIZE[indexof(Expr_A)]),
+        RS_DIV(DIV[..., indexof(Expr_A)]),
+        RS_Stride(a_stride),
+        RS_Chunk(fetch_rescale),
+        RS_Offset(a_storage_offset),
     )
     B_access = memory_access_count(
-        SIZE_ReScale[indexof(Expr_B)],
-        DIV_ReScale[..., indexof(Expr_B)],
-        b_stride,
-        fetch_rescale,
-        b_storage_offset,
+        RS_SIZE(SIZE[indexof(Expr_B)]),
+        RS_DIV(DIV[..., indexof(Expr_B)]),
+        RS_Stride(b_stride),
+        RS_Chunk(fetch_rescale),
+        RS_Offset(b_storage_offset),
     )
     C_access = memory_access_count(
-        SIZE_ReScale[indexof(Expr_C)],
-        DIV_ReScale[..., indexof(Expr_C)],
-        c_stride,
-        fetch_rescale,
-        c_storage_offset,
+        RS_SIZE(SIZE[indexof(Expr_C)]),
+        RS_DIV(DIV[..., indexof(Expr_C)]),
+        RS_Stride(c_stride),
+        RS_Chunk(fetch_rescale),
+        RS_Offset(c_storage_offset),
     )
 
     A_access_multiple = np.where(
