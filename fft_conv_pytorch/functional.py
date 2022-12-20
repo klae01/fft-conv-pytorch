@@ -152,14 +152,15 @@ def fft_conv_transpose(
             output_padding_,
         )
     ]
-
-    # Perform fourier convolution -- FFT, matrix multiply, then IFFT
-    signal_fr = rfftn(signal_, interm_shape, dim=tuple(range(2, signal.ndim)))
-    kernel_fr = rfftn(kernel_, interm_shape, dim=tuple(range(2, signal.ndim)))
-
-    output_fr = complex_matmul(signal_fr, kernel_fr.conj(), groups=groups)
-    output = irfftn(output_fr, dim=tuple(range(2, signal.ndim)))
-    output = output[
+    output = irfftn(
+        complex_matmul(
+            rfftn(signal_, interm_shape, dim=tuple(range(-n, 0))),
+            rfftn(kernel_, interm_shape, dim=tuple(range(-n, 0))).conj(),
+            groups=groups,
+        ),
+        interm_shape,
+        dim=tuple(range(-n, 0)),
+    )[
         (
             slice(None),
             slice(None),
