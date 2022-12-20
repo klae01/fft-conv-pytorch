@@ -76,16 +76,11 @@ acctype access_counter(
     vector<datatype> curr_remain(chunksize);
     vector<datatype> index(chunksize);
     vector<datatype> bin(chunksize);
-    vector<datatype> step_order(ndim);
     datatype tmp, i, lcm;
     bool keep_overlap=true;
-    tmp=ndim; for(auto &I:step_order) I=--tmp;
-    for(i=1; i<ndim && stride[i-1]>=stride[i]; i++);
-    if(i<ndim)
-        stable_sort(step_order.begin(), step_order.end(), [&v=stride](size_t i1, size_t i2) {return v[i1] < v[i2];});
-    tmp=chunksize - stride[step_order[0]];
+    tmp=chunksize - stride[0];
     inplace_acc_mod<datatype>(prev_remain, tmp, tmp, chunksize);
-    for(auto &step:step_order)
+    for(int step=0; step<ndim; step++)
     {
         fill(curr_access.begin(), curr_access.end(), 0);
         fill(bin.begin(), bin.end(), 0);

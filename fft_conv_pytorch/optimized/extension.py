@@ -91,13 +91,15 @@ def memory_access_count(
     u_DIV, indices = np.unique(DIV, axis=0, return_inverse=True)
 
     result = torch.zeros([u_DIV.shape[0]], dtype=torch.float32)
+    stride = np.array(stride, np.int64)
+    order = np.argsort(stride)
     cpu.AccessCost(
         torch.tensor(len(DIM)).type(torch.int64),
         torch.tensor(chunksize).type(torch.int64),
         torch.tensor(offset).type(torch.int64),
-        torch.from_numpy(DIM.astype(np.int64)),
-        torch.tensor(stride).type(torch.int64),
-        torch.from_numpy(u_DIV.astype(np.int64)),
+        torch.from_numpy(DIM[order].astype(np.int64)),
+        torch.from_numpy(stride[order].astype(np.int64)),
+        torch.from_numpy(u_DIV[..., order].astype(np.int64)),
         result,
     )
     return result.numpy()[indices]
