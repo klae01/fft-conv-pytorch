@@ -65,16 +65,16 @@ def fft_conv(
     # have *even* length.  Just pad with one more zero if the final dimension is odd.
     interm_shape = [(s + 1) // 2 * 2 for s in signal.shape[2:]]
 
-    # Perform fourier convolution -- FFT, matrix multiply, then IFFT
-    signal_fr = rfftn(signal, interm_shape, dim=tuple(range(2, signal.ndim)))
-    kernel_fr = rfftn(kernel, interm_shape, dim=tuple(range(2, signal.ndim)))
-
-    output_fr = complex_matmul(signal_fr, kernel_fr.conj(), groups=groups)
-    output = irfftn(output_fr, dim=tuple(range(2, signal.ndim)))
-
-    # Remove extra padded values
-    output = output[
-        [slice(0, output.size(0)), slice(0, output.size(1))]
+    output = irfftn(
+        complex_matmul(
+            rfftn(signal, interm_shape, dim=tuple(range(-n, 0))),
+            rfftn(kernel, interm_shape, dim=tuple(range(-n, 0))).conj(),
+            groups=groups,
+        ),
+        interm_shape,
+        dim=tuple(range(-n, 0)),
+    )[
+        [slice(None)] * 2
         + [
             slice(0, (signal.size(i) - kernel.size(i) + 1), stride_[i - 2])
             for i in range(2, signal.ndim)
