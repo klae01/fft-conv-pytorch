@@ -4,8 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as f
 
-from fft_conv_pytorch.fft_conv import fft_conv, to_ntuple
-from fft_conv_pytorch.utils import _assert_almost_equal, _gcd
+from fft_conv_pytorch.benchmark_utils import _assert_almost_equal, _gcd
+from fft_conv_pytorch.functional import fft_conv, to_ntuple
 
 
 @pytest.mark.parametrize("in_channels", [2, 3])
@@ -36,13 +36,6 @@ def test_fft_conv_functional(
     batch_size = 2  # TODO: Make this non-constant?
     dims = ndim * [input_size]
     signal = torch.randn(batch_size, in_channels, *dims)
-    kwargs = dict(
-        bias=torch.randn(out_channels) if bias else None,
-        padding=padding,
-        stride=stride,
-        dilation=dilation,
-        groups=groups,
-    )
 
     kernel_size = to_ntuple(kernel_size, n=signal.ndim - 2)
     w0 = torch.randn(

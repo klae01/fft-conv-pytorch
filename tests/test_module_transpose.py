@@ -5,7 +5,11 @@ import torch
 import torch.nn.functional as f
 
 from fft_conv_pytorch.benchmark_utils import _assert_almost_equal, _gcd
-from fft_conv_pytorch.nn import FFTConv1d, FFTConv2d, FFTConv3d
+from fft_conv_pytorch.nn import (
+    FFTConvTranspose1d,
+    FFTConvTranspose2d,
+    FFTConvTranspose3d,
+)
 
 
 @pytest.mark.parametrize("in_channels", [2, 3])
@@ -13,6 +17,7 @@ from fft_conv_pytorch.nn import FFTConv1d, FFTConv2d, FFTConv3d
 @pytest.mark.parametrize("groups", [1, 2, 3])
 @pytest.mark.parametrize("kernel_size", [2, 3])
 @pytest.mark.parametrize("padding", [0, 1])
+@pytest.mark.parametrize("output_padding", [0, 1, 2])
 @pytest.mark.parametrize("stride", [1, 2])
 @pytest.mark.parametrize("dilation", [1, 2])
 @pytest.mark.parametrize("bias", [True])
@@ -23,6 +28,7 @@ def test_fft_conv_module(
     out_channels: int,
     kernel_size: Union[int, Iterable[int]],
     padding: Union[int, Iterable[int]],
+    output_padding: Union[int, Iterable[int]],
     stride: Union[int, Iterable[int]],
     dilation: Union[int, Iterable[int]],
     groups: int,
@@ -30,13 +36,18 @@ def test_fft_conv_module(
     ndim: int,
     input_size: int,
 ):
-    torch_conv = getattr(f, f"conv{ndim}d")
+    dilation += output_padding
+    stride += output_padding
+    torch_conv = getattr(f, f"conv_transpose{ndim}d")
     groups = _gcd(in_channels, _gcd(out_channels, groups))
-    fft_conv_layer = [FFTConv1d, FFTConv2d, FFTConv3d][ndim - 1](
+    fft_conv_layer = [FFTConvTranspose1d, FFTConvTranspose2d, FFTConvTranspose3d][
+        ndim - 1
+    ](
         in_channels=in_channels,
         out_channels=out_channels,
         kernel_size=kernel_size,
         padding=padding,
+        output_padding=output_padding,
         stride=stride,
         dilation=dilation,
         groups=groups,
@@ -51,6 +62,7 @@ def test_fft_conv_module(
 
     kwargs = dict(
         padding=padding,
+        output_padding=output_padding,
         stride=stride,
         dilation=dilation,
         groups=groups,
@@ -67,6 +79,7 @@ def test_fft_conv_module(
 @pytest.mark.parametrize("groups", [1, 2, 3])
 @pytest.mark.parametrize("kernel_size", [2, 3])
 @pytest.mark.parametrize("padding", [0, 1])
+@pytest.mark.parametrize("output_padding", [0, 1, 2])
 @pytest.mark.parametrize("stride", [1, 2])
 @pytest.mark.parametrize("dilation", [1, 2])
 @pytest.mark.parametrize("bias", [True])
@@ -77,6 +90,7 @@ def test_fft_conv_backward_module(
     out_channels: int,
     kernel_size: Union[int, Iterable[int]],
     padding: Union[int, Iterable[int]],
+    output_padding: Union[int, Iterable[int]],
     stride: Union[int, Iterable[int]],
     dilation: Union[int, Iterable[int]],
     groups: int,
@@ -84,13 +98,18 @@ def test_fft_conv_backward_module(
     ndim: int,
     input_size: int,
 ):
-    torch_conv = getattr(f, f"conv{ndim}d")
+    dilation += output_padding
+    stride += output_padding
+    torch_conv = getattr(f, f"conv_transpose{ndim}d")
     groups = _gcd(in_channels, _gcd(out_channels, groups))
-    fft_conv_layer = [FFTConv1d, FFTConv2d, FFTConv3d][ndim - 1](
+    fft_conv_layer = [FFTConvTranspose1d, FFTConvTranspose2d, FFTConvTranspose3d][
+        ndim - 1
+    ](
         in_channels=in_channels,
         out_channels=out_channels,
         kernel_size=kernel_size,
         padding=padding,
+        output_padding=output_padding,
         stride=stride,
         dilation=dilation,
         groups=groups,
@@ -107,6 +126,7 @@ def test_fft_conv_backward_module(
 
     kwargs = dict(
         padding=padding,
+        output_padding=output_padding,
         stride=stride,
         dilation=dilation,
         groups=groups,

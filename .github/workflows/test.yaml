@@ -31,7 +31,7 @@ jobs:
 
       - name: Test
         run: |
-          pytest --cov --cov-report term-missing --cov-fail-under 90 tests/
+          NUMBA_DISABLE_JIT=1 pytest --cov --cov-report term-missing --cov-fail-under 90 tests/
           black --check .
           isort --diff .
           flake8 .
