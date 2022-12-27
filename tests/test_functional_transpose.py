@@ -36,13 +36,6 @@ def test_fft_conv_transpose_functional(
     batch_size = 2  # TODO: Make this non-constant?
     dims = ndim * [input_size]
     signal = torch.randn(batch_size, in_channels, *dims)
-    kwargs = dict(
-        bias=torch.randn(out_channels) if bias else None,
-        padding=padding,
-        stride=stride,
-        dilation=dilation,
-        groups=groups,
-    )
 
     kernel_size = to_ntuple(kernel_size, n=signal.ndim - 2)
     w0 = torch.randn(

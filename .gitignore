@@ -132,3 +132,6 @@ dmypy.json
 
 # Pytest
 .coverage
+
+# cpp code
+!/fft_conv_pytorch/*/lib
